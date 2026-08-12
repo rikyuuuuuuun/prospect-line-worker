@@ -30,3 +30,7 @@ The current Worker source also supports the legacy `LINE_CHANNEL_SECRET` fallbac
 5. Cloudflare Workers Builds deploys `main` automatically.
 
 Do not move secret values into `wrangler.jsonc`, source code, or `.env` files committed to GitHub.
+
+## Deployment status
+
+GitHub-to-Cloudflare automatic deployment is enabled for the `main` branch.
