@@ -59,21 +59,22 @@ const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 // 活動申込は全会場共通URLで使います。GAS転送時だけ既存の有効ルートを内部利用します。
 const ACTIVITY_GAS_ROUTE = 'a/saitama-shibakawa';
 const ACTIVITY_LIFF_ID = '2011040394-O4z7w36C';
-const WORKER_BUILD = '2026-08-12-reservation-stable2';
-const WORKER_RELEASE = '2026-08-12-reservation-stable2';
-const EXPECTED_GAS_BUILD = '2026-08-12-activity-stable2';
+const WORKER_BUILD = '2026-09-05-p06-gas-v38-compat';
+const WORKER_RELEASE = '2026-09-05-p06-gas-v38-compat';
+const EXPECTED_GAS_BUILD = '2026-08-13-single-slot-auto1';
+const RESERVATION_UPSTREAM_MAX_AGE_MS = 900000;
 // 体験予約の公開情報（開催日・クラス・時間）だけをCloudflare側で短時間キャッシュします。
 // LINE本人確認は予約保存時に必ず実施し、初期表示では外部のLINE検証APIを待たない設計です。
 const RESERVATION_AVAILABILITY_EDGE_FRESH_MS = 180000;
 const RESERVATION_AVAILABILITY_EDGE_STALE_MS = 3600000;
 // GASのHTTP入口だけが一時失敗した場合に限り、同じCache API内の最終正常値を最大24時間まで退避利用します。
-// 予約保存時はGASで日程・クラスを再検証するため、古い表示だけで予約が確定することはありません。
+// 予約保存前はWorkerからGASの最新日程・クラスを再取得し、古い表示だけで予約を確定させません。
 const RESERVATION_AVAILABILITY_EDGE_EMERGENCY_MS = 86400000;
 const GRADES = Object.freeze([
   '年少', '年中', '年長', '1年生', '2年生', '3年生',
   '4年生', '5年生', '6年生',
 ]);
-const CLASSES = Object.freeze(['前半', '後半', '相談したい']);
+const CLASSES = Object.freeze(['前半', '後半', '相談したい', '①クラス', '②クラス', '③クラス']);
 const CLASS_LABELS_BY_ROUTE = Object.freeze({
   'a/saitama-shibakawa': Object.freeze({
     '前半': '前半（18:15〜19:05）',
@@ -202,9 +203,15 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh) 
   if (!result) throw new Error('gas_empty_response');
   if (result.ok === false) throw new Error(mapGasRejection_(result.message));
   if (!Array.isArray(result.dates)) throw new Error('gas_wrong_or_old_backend');
-  // The legacy upstream fallback has no original generation timestamp. Only
-  // this edge's bounded last-good entry may be used during an outage.
-  if (result.fallback) throw new Error('availability_unverified_fallback');
+  // v38 returns the original generation time, including for snapshot fallback.
+  // Unverifiable/old snapshots require one bounded live refresh; they never
+  // become fresh merely because this Worker received them again.
+  if (!forceRefresh && !isVerifiedUpstreamAvailabilityAge_(result)) {
+    return loadReservationAvailabilityPayload_(env, routeKey, true);
+  }
+  if (!isVerifiedUpstreamAvailabilityAge_(result) || (forceRefresh && result.fallback)) {
+    throw new Error('availability_unverified_fallback');
+  }
   const dates = result.dates.map(function (item) {
     return {
       value: safeSingleLine_(item && item.value, 10),
@@ -241,7 +248,15 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh) 
     classes: classes,
     fixedClass: fixedClass || '',
     fallback: Boolean(result.fallback),
+    generatedAt: Number(result.generatedAt),
   };
+}
+
+function isVerifiedUpstreamAvailabilityAge_(result) {
+  const generatedAt = result && result.generatedAt;
+  return typeof generatedAt === 'number' && Number.isFinite(generatedAt) &&
+    generatedAt > 0 && generatedAt <= Date.now() &&
+    Date.now() - generatedAt <= RESERVATION_UPSTREAM_MAX_AGE_MS;
 }
 
 async function refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey) {
@@ -249,7 +264,7 @@ async function refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey)
     // Edge拠点ごとの更新が同時発生しても、GASの5分キャッシュを迂回してSpreadsheetへ集中しないようにします。
     const payload = await loadReservationAvailabilityPayload_(env, routeKey, false);
     if (payload.fallback) return; // Never renew the age of an upstream fallback.
-    const response = reservationAvailabilityResponse_(payload, Date.now());
+    const response = reservationAvailabilityResponse_(payload, payload.generatedAt);
     if (typeof caches !== 'undefined' && caches.default) {
       await caches.default.put(cacheKey, response.clone());
     }
@@ -302,7 +317,7 @@ async function handleReservationAvailability_(request, env, ctx) {
       }
       throw error;
     }
-    const response = reservationAvailabilityResponse_(payload, Date.now());
+    const response = reservationAvailabilityResponse_(payload, payload.generatedAt);
     if (cacheAvailable && !payload.fallback) {
       await caches.default.put(cacheKey, response.clone());
     }
@@ -390,6 +405,7 @@ async function handleReservationSubmit_(request, env) {
     const routeKey = requireRoute_(body.route);
     const identity = await verifyLineIdToken_(body.idToken, env);
     const reservation = validateReservation_(body, routeKey);
+    await verifyReservationAvailabilityBeforeSubmit_(env, routeKey, reservation);
     const result = await forwardToGas_(env, routeKey, JSON.stringify({
       source: 'reservation_form',
       requestId: reservation.requestId,
@@ -414,6 +430,17 @@ async function handleReservationSubmit_(request, env) {
   } catch (error) {
     return reservationError_(error);
   }
+}
+
+async function verifyReservationAvailabilityBeforeSubmit_(env, routeKey, reservation) {
+  const availability = await loadReservationAvailabilityPayload_(env, routeKey, true);
+  const selected = availability.classes.find(function (item) { return item.value === reservation.className; });
+  if (!selected || selected.status === 'closed') throw new Error('class_closed');
+  const expected = reservation.receptionType === 'waitlist' ? 'waitlist' : 'open';
+  if (selected.status !== expected) throw new Error('class_status_changed');
+  if (reservation.receptionType === 'reservation' && !availability.dates.some(function (item) {
+    return item.value === reservation.experienceDate;
+  })) throw new Error('selected_date_unavailable');
 }
 
 async function handleActivityForm_(request, env) {
