@@ -202,6 +202,9 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh) 
   if (!result) throw new Error('gas_empty_response');
   if (result.ok === false) throw new Error(mapGasRejection_(result.message));
   if (!Array.isArray(result.dates)) throw new Error('gas_wrong_or_old_backend');
+  // The legacy upstream fallback has no original generation timestamp. Only
+  // this edge's bounded last-good entry may be used during an outage.
+  if (result.fallback) throw new Error('availability_unverified_fallback');
   const dates = result.dates.map(function (item) {
     return {
       value: safeSingleLine_(item && item.value, 10),
@@ -210,7 +213,8 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh) 
   }).filter(function (item) {
     return /^\d{4}-\d{2}-\d{2}$/.test(item.value) && item.label;
   }).slice(0, 15);
-  const rawClasses = Array.isArray(result.classes) ? result.classes : [];
+  if (!Array.isArray(result.classes) || !result.classes.length) throw new Error('availability_classes_missing');
+  const rawClasses = result.classes;
   const classesByValue = {};
   rawClasses.forEach(function (item) {
     const value = safeSingleLine_(item && item.value, 20);
@@ -218,20 +222,18 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh) 
     const time = safeSingleLine_(item && item.time, 40);
     const status = safeSingleLine_(item && item.status, 20).toLowerCase();
     if (CLASSES.indexOf(value) !== -1 && ['open', 'waitlist', 'closed'].indexOf(status) !== -1) {
+      if (classesByValue[value]) throw new Error('availability_classes_invalid');
       classesByValue[value] = { value: value, label: label, time: time, status: status };
-    }
+    } else { throw new Error('availability_classes_invalid'); }
   });
-  let classes = rawClasses.length
-    ? CLASSES.map(function (value) { return classesByValue[value]; }).filter(Boolean)
-    : CLASSES.map(function (value) {
-      return { value: value, label: value, time: '', status: 'open' };
-    });
+  let classes = CLASSES.map(function (value) { return classesByValue[value]; }).filter(Boolean);
   const gasFixedClass = safeSingleLine_(result.fixedClass, 20);
   const fixedClass = CLASSES.indexOf(gasFixedClass) !== -1
     ? gasFixedClass
     : ROUTES[routeKey].fixedClass;
   if (fixedClass) {
     classes = classes.filter(function (item) { return item.value === fixedClass; });
+    if (!classes.length) throw new Error('availability_fixed_class_missing');
   }
   return {
     ok: true,
@@ -246,6 +248,7 @@ async function refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey)
   try {
     // Edge拠点ごとの更新が同時発生しても、GASの5分キャッシュを迂回してSpreadsheetへ集中しないようにします。
     const payload = await loadReservationAvailabilityPayload_(env, routeKey, false);
+    if (payload.fallback) return; // Never renew the age of an upstream fallback.
     const response = reservationAvailabilityResponse_(payload, Date.now());
     if (typeof caches !== 'undefined' && caches.default) {
       await caches.default.put(cacheKey, response.clone());
@@ -269,7 +272,7 @@ async function handleReservationAvailability_(request, env, ctx) {
       const cached = await caches.default.match(cacheKey);
       if (cached) {
         const cachedAt = Number(cached.headers.get('x-prospect-cached-at') || 0);
-        const age = cachedAt > 0 ? Math.max(0, Date.now() - cachedAt) : Number.MAX_SAFE_INTEGER;
+        const age = cachedAt > 0 && cachedAt <= Date.now() ? Date.now() - cachedAt : Number.MAX_SAFE_INTEGER;
         if (age <= RESERVATION_AVAILABILITY_EDGE_FRESH_MS) {
           return cached;
         }
@@ -277,7 +280,7 @@ async function handleReservationAvailability_(request, env, ctx) {
           if (ctx && typeof ctx.waitUntil === 'function') {
             ctx.waitUntil(refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey));
           }
-          return cached;
+          return await emergencyReservationAvailabilityResponse_(cached);
         }
         if (age <= RESERVATION_AVAILABILITY_EDGE_EMERGENCY_MS) {
           emergencyCached = cached;
@@ -300,13 +303,13 @@ async function handleReservationAvailability_(request, env, ctx) {
       throw error;
     }
     const response = reservationAvailabilityResponse_(payload, Date.now());
-    if (cacheAvailable) {
+    if (cacheAvailable && !payload.fallback) {
       await caches.default.put(cacheKey, response.clone());
     }
     if (payload.fallback && ctx && typeof ctx.waitUntil === 'function') {
       ctx.waitUntil(refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey));
     }
-    return response;
+    return payload.fallback ? json_(payload, 200) : response;
   } catch (error) {
     return reservationError_(error);
   }
@@ -314,7 +317,7 @@ async function handleReservationAvailability_(request, env, ctx) {
 
 async function emergencyReservationAvailabilityResponse_(cached) {
   const payload = await cached.json();
-  if (!payload || payload.ok !== true || !Array.isArray(payload.dates)) {
+  if (!payload || payload.ok !== true || !Array.isArray(payload.dates) || !Array.isArray(payload.classes) || !payload.classes.length) {
     throw new Error('gas_unreachable');
   }
   payload.fallback = true;
@@ -324,7 +327,8 @@ async function emergencyReservationAvailabilityResponse_(cached) {
 
 function isTransientAvailabilityError_(error) {
   const code = String(error && error.message || '').toLowerCase();
-  return code === 'gas_http_error' ||
+  return code === 'availability_unverified_fallback' ||
+    code === 'gas_http_error' ||
     code.indexOf('gas_http_error_') === 0 ||
     code === 'gas_http_retryable' ||
     code === 'gas_timeout' ||
@@ -1218,7 +1222,7 @@ function buildReservationHtml_(liffId) {
   function option(value){const node=document.createElement('option');node.value=value;node.textContent=value;return node}
   function fillSelect(id,values,placeholder){const select=document.getElementById(id);select.textContent='';const first=option('');first.textContent=placeholder;select.appendChild(first);values.forEach(v=>select.appendChild(option(v)))}
   function fillSelectNode(select,values,placeholder){select.textContent='';const first=option('');first.textContent=placeholder;select.appendChild(first);values.forEach(v=>select.appendChild(option(v)))}
-  function fillClassSelect(items){classSelect.textContent='';const first=option('');first.textContent='選択してください';classSelect.appendChild(first);const fallbackLabels=CONFIG.classLabelsByRoute[routeKey]||{};const source=Array.isArray(items)&&items.length?items:CONFIG.classes.map(value=>({value:value,label:fallbackLabels[value]||value,time:'',status:'open'}));source.forEach(item=>{if(!item||!CONFIG.classes.includes(item.value))return;const status=['open','waitlist','closed'].includes(item.status)?item.status:'open';const node=option(item.value);node.dataset.status=status;node.dataset.time=item.time||'';node.dataset.label=item.label||fallbackLabels[item.value]||item.value;node.textContent=node.dataset.label+(status==='waitlist'?' ※キャンセル待ち':status==='closed'?' ※受付停止':'');if(status==='closed')node.disabled=true;classSelect.appendChild(node)})}
+  function fillClassSelect(items){classSelect.textContent='';const first=option('');first.textContent='選択してください';classSelect.appendChild(first);const fallbackLabels=CONFIG.classLabelsByRoute[routeKey]||{};const source=Array.isArray(items)?items:[];source.forEach(item=>{if(!item||!CONFIG.classes.includes(item.value))return;const status=['open','waitlist','closed'].includes(item.status)?item.status:'closed';const node=option(item.value);node.dataset.status=status;node.dataset.time=item.time||'';node.dataset.label=item.label||fallbackLabels[item.value]||item.value;node.textContent=node.dataset.label+(status==='waitlist'?' ※キャンセル待ち':status==='closed'?' ※受付停止':'');if(status==='closed')node.disabled=true;classSelect.appendChild(node)})}
   function requestId(){if(crypto.randomUUID)return crypto.randomUUID();const bytes=new Uint8Array(16);crypto.getRandomValues(bytes);return Array.from(bytes,value=>value.toString(16).padStart(2,'0')).join('')}
   function fillDateSelect(items){availableDates=Array.isArray(items)?items:[];dateSelect.textContent='';const first=option('');first.textContent=availableDates.length?'体験日を選択してください':'現在、受付可能な体験日はありません';dateSelect.appendChild(first);availableDates.forEach(item=>{const node=option(item.value);node.textContent=item.label;dateSelect.appendChild(node)})}
   function selectedClassStatus(){const selected=classSelect.selectedOptions[0];return selected&&selected.dataset.status?selected.dataset.status:''}
@@ -1290,7 +1294,7 @@ function buildReservationHtml_(liffId) {
       closeButton.classList.add('hidden');
     }
   }
-  function showForm(availability){const route=CONFIG.routes[routeKey];document.getElementById('venueName').textContent=route.venue;const classes=availability&&Array.isArray(availability.classes)?availability.classes:CONFIG.classes.map(value=>({value:value,label:value,time:'',status:'open'}));const selectable=classes.some(item=>item&&['open','waitlist'].includes(item.status));if(!selectable){form.classList.add('hidden');setStatus('現在、この会場の体験受付は停止しています。','error');return false}fillClassSelect(classes);currentFixedClass=availability&&CONFIG.classes.includes(availability.fixedClass)?availability.fixedClass:'';if(currentFixedClass){classSelect.value=currentFixedClass;const selected=classSelect.selectedOptions[0];classField.classList.add('hidden');classSelect.required=false;fixedClassTime.textContent=selected&&selected.dataset.time?selected.dataset.time:selectedClassDisplay();fixedClassField.classList.remove('hidden')}else{classField.classList.remove('hidden');classSelect.required=true;fixedClassField.classList.add('hidden');fixedClassTime.textContent=''}fillDateSelect(availability&&Array.isArray(availability.dates)?availability.dates:[]);if(!childrenArea.children.length)addChild();updateReceptionMode();statusBox.classList.add('hidden');form.classList.remove('hidden');if(!lineReady){submitButton.disabled=true;submitButton.textContent='LINE接続を確認しています…'}else{submitButton.disabled=false;updateReceptionMode()}return true}
+  function showForm(availability){const route=CONFIG.routes[routeKey];document.getElementById('venueName').textContent=route.venue;const classes=availability&&Array.isArray(availability.classes)?availability.classes:[];const selectable=classes.some(item=>item&&['open','waitlist'].includes(item.status));if(!selectable){form.classList.add('hidden');setStatus('現在、この会場の体験受付は停止しています。','error');return false}fillClassSelect(classes);currentFixedClass=availability&&CONFIG.classes.includes(availability.fixedClass)?availability.fixedClass:'';if(currentFixedClass){classSelect.value=currentFixedClass;const selected=classSelect.selectedOptions[0];classField.classList.add('hidden');classSelect.required=false;fixedClassTime.textContent=selected&&selected.dataset.time?selected.dataset.time:selectedClassDisplay();fixedClassField.classList.remove('hidden')}else{classField.classList.remove('hidden');classSelect.required=true;fixedClassField.classList.add('hidden');fixedClassTime.textContent=''}fillDateSelect(availability&&Array.isArray(availability.dates)?availability.dates:[]);if(!childrenArea.children.length)addChild();updateReceptionMode();statusBox.classList.add('hidden');form.classList.remove('hidden');if(!lineReady){submitButton.disabled=true;submitButton.textContent='LINE接続を確認しています…'}else{submitButton.disabled=false;updateReceptionMode()}return true}
   addChildButton.addEventListener('click',()=>addChild());
   classSelect.addEventListener('change',()=>updateReceptionMode());
   form.addEventListener('submit',async event=>{
