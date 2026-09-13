@@ -59,8 +59,9 @@ const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 // 活動申込は全会場共通URLで使います。GAS転送時だけ既存の有効ルートを内部利用します。
 const ACTIVITY_GAS_ROUTE = 'a/saitama-shibakawa';
 const ACTIVITY_LIFF_ID = '2011040394-O4z7w36C';
-const WORKER_BUILD = '2026-09-05-p06-gas-v38-compat';
-const WORKER_RELEASE = '2026-09-05-p06-gas-v38-compat';
+const WORKER_BUILD = '2026-09-13-reservation-progressive-startup';
+const WORKER_RELEASE = '2026-09-13-reservation-progressive-startup';
+const RESERVATION_READ_BUDGET_MS = 8000;
 const EXPECTED_GAS_BUILD = '2026-08-13-single-slot-auto1';
 const RESERVATION_UPSTREAM_MAX_AGE_MS = 900000;
 // 体験予約の公開情報（開催日・クラス・時間）だけをCloudflare側で短時間キャッシュします。
@@ -191,15 +192,15 @@ function reservationAvailabilityResponse_(payload, cachedAt) {
   });
 }
 
-async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh) {
+async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh, deadlineAt) {
   const requestBody = JSON.stringify({
     source: forceRefresh ? 'reservation_availability_refresh' : 'reservation_availability',
   });
   // 初期表示は専用の有限リトライを使います。GASの正常応答を待てる長さを確保しつつ、
   // 無限待機やブラウザ側からの多重送信を避けます。
-  const result = forceRefresh
+  const result = forceRefresh && !deadlineAt
     ? await forwardToGas_(env, routeKey, requestBody)
-    : await forwardAvailabilityToGas_(env, routeKey, requestBody);
+    : await forwardAvailabilityToGas_(env, routeKey, requestBody, deadlineAt);
   if (!result) throw new Error('gas_empty_response');
   if (result.ok === false) throw new Error(mapGasRejection_(result.message));
   if (!Array.isArray(result.dates)) throw new Error('gas_wrong_or_old_backend');
@@ -207,7 +208,7 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh) 
   // Unverifiable/old snapshots require one bounded live refresh; they never
   // become fresh merely because this Worker received them again.
   if (!forceRefresh && !isVerifiedUpstreamAvailabilityAge_(result)) {
-    return loadReservationAvailabilityPayload_(env, routeKey, true);
+    return loadReservationAvailabilityPayload_(env, routeKey, true, deadlineAt);
   }
   if (!isVerifiedUpstreamAvailabilityAge_(result) || (forceRefresh && result.fallback)) {
     throw new Error('availability_unverified_fallback');
@@ -262,7 +263,7 @@ function isVerifiedUpstreamAvailabilityAge_(result) {
 async function refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey) {
   try {
     // Edge拠点ごとの更新が同時発生しても、GASの5分キャッシュを迂回してSpreadsheetへ集中しないようにします。
-    const payload = await loadReservationAvailabilityPayload_(env, routeKey, false);
+    const payload = await loadReservationAvailabilityPayload_(env, routeKey, false, Date.now() + RESERVATION_READ_BUDGET_MS);
     if (payload.fallback) return; // Never renew the age of an upstream fallback.
     const response = reservationAvailabilityResponse_(payload, payload.generatedAt);
     if (typeof caches !== 'undefined' && caches.default) {
@@ -273,60 +274,72 @@ async function refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey)
   }
 }
 
+// Cache API is an optional accelerator. Its failures must not discard a valid read.
+async function readAvailabilityCache_(cacheKey) {
+  try {
+    return typeof caches !== 'undefined' && caches.default ? await caches.default.match(cacheKey) : null;
+  } catch (_) { return null; }
+}
+
+async function storeAvailabilityCache_(cacheKey, response) {
+  try {
+    if (typeof caches !== 'undefined' && caches.default) await caches.default.put(cacheKey, response);
+  } catch (_) { console.warn('reservation_availability_cache_write_failed'); }
+}
+
+function availabilityDeliveryResponse_(response, cacheState, startedAt) {
+  const headers = new Headers(response.headers);
+  // The internal GET cache has a long TTL; never expose that TTL on this POST API.
+  headers.set('cache-control', 'no-store');
+  headers.set('x-prospect-cache', cacheState);
+  headers.set('server-timing', 'availability;dur=' + Math.max(0, Date.now() - startedAt));
+  return new Response(response.body, { status: response.status, headers });
+}
+
 async function handleReservationAvailability_(request, env, ctx) {
+  const startedAt = Date.now();
   try {
     const body = await readJsonBody_(request);
     const routeKey = requireRoute_(body.route);
-
-    // 開催日・クラス・表示時間は個人情報ではないため、初期表示ではLINE IDトークン検証を待ちません。
-    // 本人確認は /api/reservations の保存時に必ず実施します。
-    const cacheAvailable = typeof caches !== 'undefined' && Boolean(caches.default);
     const cacheKey = reservationAvailabilityCacheKey_(request, routeKey);
+    const cached = await readAvailabilityCache_(cacheKey);
     let emergencyCached = null;
-    if (cacheAvailable) {
-      const cached = await caches.default.match(cacheKey);
-      if (cached) {
-        const cachedAt = Number(cached.headers.get('x-prospect-cached-at') || 0);
-        const age = cachedAt > 0 && cachedAt <= Date.now() ? Date.now() - cachedAt : Number.MAX_SAFE_INTEGER;
-        if (age <= RESERVATION_AVAILABILITY_EDGE_FRESH_MS) {
-          return cached;
-        }
-        if (age <= RESERVATION_AVAILABILITY_EDGE_STALE_MS) {
-          if (ctx && typeof ctx.waitUntil === 'function') {
-            ctx.waitUntil(refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey));
-          }
-          return await emergencyReservationAvailabilityResponse_(cached);
-        }
-        if (age <= RESERVATION_AVAILABILITY_EDGE_EMERGENCY_MS) {
-          emergencyCached = cached;
-        }
+    if (cached) {
+      const cachedAt = Number(cached.headers.get('x-prospect-cached-at') || 0);
+      const age = cachedAt > 0 && cachedAt <= Date.now() ? Date.now() - cachedAt : Number.MAX_SAFE_INTEGER;
+      if (age <= RESERVATION_AVAILABILITY_EDGE_FRESH_MS) {
+        return availabilityDeliveryResponse_(cached, 'HIT', startedAt);
       }
+      if (age <= RESERVATION_AVAILABILITY_EDGE_STALE_MS) {
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey));
+        }
+        return availabilityDeliveryResponse_(await emergencyReservationAvailabilityResponse_(cached), 'STALE', startedAt);
+      }
+      if (age <= RESERVATION_AVAILABILITY_EDGE_EMERGENCY_MS) emergencyCached = cached;
     }
 
     let payload;
     try {
-      payload = await loadReservationAvailabilityPayload_(env, routeKey, false);
+      // One total budget includes retries, response bodies and an age-verification refresh.
+      payload = await loadReservationAvailabilityPayload_(env, routeKey, false, startedAt + RESERVATION_READ_BUDGET_MS);
     } catch (error) {
       if (emergencyCached && isTransientAvailabilityError_(error)) {
-        console.warn(JSON.stringify({
-          event: 'reservation_availability_edge_fallback',
-          route: routeKey,
-          reason: String(error && error.message || error),
-        }));
-        return await emergencyReservationAvailabilityResponse_(emergencyCached);
+        return availabilityDeliveryResponse_(await emergencyReservationAvailabilityResponse_(emergencyCached), 'EMERGENCY', startedAt);
       }
       throw error;
     }
     const response = reservationAvailabilityResponse_(payload, payload.generatedAt);
-    if (cacheAvailable && !payload.fallback) {
-      await caches.default.put(cacheKey, response.clone());
-    }
-    if (payload.fallback && ctx && typeof ctx.waitUntil === 'function') {
+    if (!payload.fallback) {
+      const write = storeAvailabilityCache_(cacheKey, response.clone());
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(write);
+      else await write;
+    } else if (ctx && typeof ctx.waitUntil === 'function') {
       ctx.waitUntil(refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey));
     }
-    return payload.fallback ? json_(payload, 200) : response;
+    return availabilityDeliveryResponse_(response, payload.fallback ? 'FALLBACK' : 'MISS', startedAt);
   } catch (error) {
-    return reservationError_(error);
+    return availabilityDeliveryResponse_(reservationError_(error), 'ERROR', startedAt);
   }
 }
 
@@ -837,63 +850,48 @@ async function verifyLineIdToken_(idToken, env) {
 }
 
 /**
- * 初期表示専用のGAS転送。
- * 1回目を十分待ち、タイムアウトは最大2回、すぐ返るHTTPエラーは最大3回までに限定します。
- * ブラウザはこの1リクエストだけを待つため、同じ会場への多重アクセスを増やしません。
+ * Public availability reads have one wall-clock budget, including body reads.
+ * Retry only a completed transient failure; never hedge a slow GAS execution.
  */
-async function forwardAvailabilityToGas_(env, routeKey, body) {
+async function forwardAvailabilityToGas_(env, routeKey, body, deadlineAt) {
   if (!env.GAS_WEBHOOK_URL || !env.GAS_FORWARD_KEY) throw new Error('gas_not_configured');
   const forwardUrl = new URL(env.GAS_WEBHOOK_URL);
   forwardUrl.searchParams.set('key', env.GAS_FORWARD_KEY);
   forwardUrl.searchParams.set('route', routeKey);
-  const timeouts = [30000, 18000, 12000];
+  const deadline = deadlineAt || Date.now() + RESERVATION_READ_BUDGET_MS;
   let lastError = new Error('gas_unreachable');
-  let lastResult = null;
-  let timeoutCount = 0;
-
-  for (let attempt = 0; attempt < timeouts.length; attempt += 1) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('gas_timeout');
+    const controller = new AbortController();
+    const timer = setTimeout(function () { controller.abort(); }, remaining);
     try {
-      const response = await fetchWithTimeout_(forwardUrl.toString(), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: body,
-        redirect: 'follow',
-      }, timeouts[attempt]);
+      const response = await fetch(forwardUrl.toString(), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body, redirect: 'follow', signal: controller.signal,
+      });
       if (!response.ok) {
         lastError = gasHttpError_(response, 'reservation_availability', attempt + 1, true);
-        // GAS本体の認証エラーはHTTP 200のJSONで返ります。GoogleのHTTP入口が返す
-        // 403/405等も一時応答になり得るため、初期表示では有限回だけ再確認します。
+        if (response.body) await response.body.cancel();
         if (!isRetryableGasGatewayStatus_(response.status)) throw lastError;
       } else {
-        const text = await response.text();
-        try {
-          lastResult = text ? JSON.parse(text) : { ok: true };
-        } catch (parseError) {
-          lastError = new Error('gas_invalid_json');
-          lastResult = null;
-        }
-        if (lastResult && (lastResult.ok !== false || !isRetryableGasRejection_(lastResult.message))) {
-          return lastResult;
-        }
-        if (lastResult) lastError = new Error(mapGasReservationError_(lastResult.message));
+        const raw = await response.text();
+        let result;
+        try { result = raw ? JSON.parse(raw) : null; }
+        catch (_) { throw new Error('gas_invalid_json'); }
+        if (!result) throw new Error('gas_empty_response');
+        if (result.ok !== false || !isRetryableGasRejection_(result.message)) return result;
+        lastError = new Error(mapGasReservationError_(result.message));
       }
     } catch (error) {
-      const code = String(error && error.message || '');
-      if (code === 'gas_not_configured' || code.indexOf('gas_http_error_') === 0) {
-        lastError = error;
-        if (code.indexOf('gas_http_error_') === 0 &&
-            !isRetryableGasGatewayStatus_(error && error.upstreamStatus)) throw error;
-      } else if (code === 'upstream_timeout') {
-        timeoutCount += 1;
-        lastError = new Error('gas_timeout');
-        if (timeoutCount >= 2) break;
-      } else {
-        lastError = new Error(code || 'gas_unreachable');
-      }
-    }
-    if (attempt + 1 < timeouts.length) await delay_(attempt === 0 ? 800 : 1500);
+      if (controller.signal.aborted || (error && error.name === 'AbortError')) throw new Error('gas_timeout');
+      if (error && error.upstreamStatus && !isRetryableGasGatewayStatus_(error.upstreamStatus)) throw error;
+      lastError = error;
+      if (!isTransientAvailabilityError_(error) && !(error instanceof TypeError)) throw error;
+    } finally { clearTimeout(timer); }
+    if (attempt === 0 && deadline - Date.now() > 300) await delay_(250);
+    else break;
   }
-  if (lastResult) return lastResult;
   throw lastError;
 }
 
@@ -1158,7 +1156,7 @@ function buildReservationHtml_(liffId) {
   <title>体操&amp;トランポリンクラブ｜体験予約</title>
   <link rel="preconnect" href="https://static.line-scdn.net" crossorigin>
   <link rel="dns-prefetch" href="//static.line-scdn.net">
-  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <link rel="preload" href="https://static.line-scdn.net/liff/edge/2/sdk.js" as="script">
   <style>
     :root{color-scheme:light;--navy:#17324d;--blue:#1677ff;--pale:#eef5fb;--ink:#1d2733;--muted:#667383;--line:#d7e0e8;--danger:#bf2f38}
     *{box-sizing:border-box}body{margin:0;background:#f4f7fa;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif}
@@ -1179,10 +1177,15 @@ function buildReservationHtml_(liffId) {
 <main>
   <section class="hero"><small>体操&amp;トランポリンクラブ</small><h1>体験予約</h1><p>選択式のフォームで、約1分で予約できます。</p></section>
   <section class="card" id="formCard">
-    <div id="status" class="status loading">LINEと接続しています。<br>通常10秒ほどかかります。<br>画面を閉じずにそのままお待ちください。</div>
-    <form id="reservationForm" class="hidden">
+    <div id="lineStatus" class="status loading" role="status" aria-live="polite">LINEに接続しています。先にお子さまの情報を入力できます。</div>
+    <button id="retryLineButton" class="secondary hidden" type="button">LINE接続を再試行する</button>
+    <div id="availabilityStatus" class="status loading" role="status" aria-live="polite">日程・クラスを確認しています。</div>
+    <button id="retryAvailabilityButton" class="secondary hidden" type="button">日程・クラスを再取得する</button>
+    <div id="status" class="status hidden" role="status" aria-live="polite"></div>
+    <noscript>予約にはJavaScriptが必要です。LINEのトークから体験予約を開いてください。</noscript>
+    <form id="reservationForm">
       <div class="venue"><strong id="venueName"></strong></div>
-      <div id="classField" class="field"><label for="className">希望クラス<span class="required">必須</span></label><select id="className" name="className" required></select></div>
+      <div id="classField" class="field"><label for="className">希望クラス<span class="required">必須</span></label><select id="className" name="className" required disabled><option value="">日程・クラスを確認しています…</option></select></div>
       <div id="fixedClassField" class="fixed-class hidden"><span>活動時間</span><strong id="fixedClassTime"></strong></div>
       <div id="classNotice" class="class-notice waitlist-notice hidden"></div>
       <div id="dateField" class="field hidden"><label for="experienceDate">体験希望日<span class="required">必須</span></label><select id="experienceDate" name="experienceDate"></select><div class="hint">体験活動日が決まり次第、順次追加されます。</div></div>
@@ -1191,7 +1194,7 @@ function buildReservationHtml_(liffId) {
       <button id="addChildButton" class="add-child" type="button">＋ 兄弟・姉妹を追加する</button>
       <div class="field"><label for="referrer">紹介してくれた方</label><input id="referrer" name="referrer" maxlength="80" placeholder="知人・お友達のお名前（いなければ空欄）"></div>
       <div class="field"><label for="notes">相談・連絡事項</label><textarea id="notes" name="notes" maxlength="300" placeholder="体操経験や心配なことなど（任意）"></textarea></div>
-      <button id="submitButton" class="primary" type="submit">この内容で予約する</button>
+      <button id="submitButton" class="primary" type="submit" disabled>接続を確認しています…</button>
     </form>
     <div id="success" class="success hidden"><h2 id="successTitle">予約を受け付けました</h2><p id="chatStatus">担当スタッフが内容を確認後、こちらからLINEいたしますので、しばらくお待ちください。</p><button id="retryChatButton" class="primary hidden" type="button">LINEのトークへ送信する</button><button id="closeButton" class="secondary" type="button">閉じる</button></div>
   </section>
@@ -1199,6 +1202,10 @@ function buildReservationHtml_(liffId) {
 <script>
   const CONFIG=${config};
   const statusBox=document.getElementById('status');
+  const lineStatus=document.getElementById('lineStatus');
+  const availabilityStatus=document.getElementById('availabilityStatus');
+  const retryLineButton=document.getElementById('retryLineButton');
+  const retryAvailabilityButton=document.getElementById('retryAvailabilityButton');
   const form=document.getElementById('reservationForm');
   const submitButton=document.getElementById('submitButton');
   const classField=document.getElementById('classField');
@@ -1215,29 +1222,138 @@ function buildReservationHtml_(liffId) {
   const retryChatButton=document.getElementById('retryChatButton');
   const closeButton=document.getElementById('closeButton');
   const MAX_CHILDREN=6;
+  let sdkPromise=null;let lineTask=null;let availabilityTask=null;
+  let availabilityReady=false;let submitting=false;let completed=false;let preparedRoute='';
   let routeKey='';let idToken='';let lineReady=false;let pendingRequestId='';let pendingPayloadKey='';let pendingChatMessage='';let pendingReceptionType='reservation';let availableDates=[];let currentFixedClass='';
 
-  function getRoute(){
-    const direct=new URLSearchParams(location.search).get('route');
+  function routeFromUrl(url){
+    const direct=url.searchParams.get('route');
     if(direct&&CONFIG.routes[direct])return direct;
-    const state=new URLSearchParams(location.search).get('liff.state');
-    if(state){try{const decoded=decodeURIComponent(state);const q=decoded.indexOf('?')>=0?decoded.slice(decoded.indexOf('?')):decoded;const value=new URLSearchParams(q).get('route');if(value&&CONFIG.routes[value])return value;}catch(e){}}
-    const prefix='/reserve/';const path=location.pathname.toLowerCase();const pathRoute=path.startsWith(prefix)?path.slice(prefix.length):'';return CONFIG.routes[pathRoute]?pathRoute:'';
+    const pathRoute=url.pathname.startsWith('/reserve/')?url.pathname.slice('/reserve/'.length):'';
+    return CONFIG.routes[pathRoute]?pathRoute:'';
   }
-  function setStatus(message,type){statusBox.textContent=message;statusBox.className='status '+type;statusBox.classList.remove('hidden')}
-  function clearProgressTimers(timers){while(timers.length)clearTimeout(timers.pop())}
-  function startLineProgress(timers){clearProgressTimers(timers);setStatus('LINEと接続しています。\\n通常10秒ほどかかります。\\n画面を閉じずにそのままお待ちください。','loading');timers.push(setTimeout(()=>setStatus('LINEと会場情報を確認しています。\\n通常10秒ほどかかります。\\n画面を閉じずにそのままお待ちください。','loading'),4000));timers.push(setTimeout(()=>setStatus('LINEとの接続に時間がかかっています。\\n接続完了を待っていますので、そのままお待ちください。','loading'),15000))}
-  function startAvailabilityProgress(timers){clearProgressTimers(timers);setStatus('LINEと会場情報を確認しています。\\n通常10秒ほどかかります。\\n画面を閉じずにそのままお待ちください。','loading');timers.push(setTimeout(()=>setStatus('通信に時間がかかっています。\\nそのまま接続完了を待っています…','loading'),12000));timers.push(setTimeout(()=>setStatus('通信に時間がかかっています。\\n自動でもう一度確認しています…','loading'),23000))}
+  function getRoute(){
+    const current=new URL(location.href);
+    const state=current.searchParams.get('liff.state');
+    // URLSearchParams has already decoded the outer parameter. Read it, never rewrite it.
+    if(state){try{const stateUrl=new URL(state,location.origin+'/reserve/');const value=routeFromUrl(stateUrl);if(value)return value;const relative=stateUrl.pathname.slice(1);if(CONFIG.routes[relative])return relative}catch(_){}}
+    return routeFromUrl(current);
+  }
+  function markPhase(name){
+    if(window.performance&&typeof performance.mark==='function')performance.mark('reservation:'+name);
+  }
+  function setStatus(message,type){statusBox.textContent=message;statusBox.className='status '+type}
+  function setPhase(element,message,type){element.textContent=message;element.className='status '+type}
   function withTimeout(promise,ms,label){let timer;const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(label||'timeout')),ms)});return Promise.race([promise,timeout]).finally(()=>clearTimeout(timer))}
-  function isPermanentLiffInitError(error){return ['INVALID_CONFIG','UNAUTHORIZED','FORBIDDEN'].includes(String(error&&error.code||''))}
-  async function initializeLiffWithRetry(){
-    try{return await withTimeout(liff.init({liffId:CONFIG.liffId,withLoginOnExternalBrowser:true}),25000,'LIFF_INIT_TIMEOUT')}
-    catch(error){
-      if((error&&error.message)==='LIFF_INIT_TIMEOUT'||isPermanentLiffInitError(error))throw error;
-      setStatus('LINEとの接続に時間がかかっています。\\n自動でもう一度確認しています…','loading');
-      await wait(1000);
-      return await withTimeout(liff.init({liffId:CONFIG.liffId,withLoginOnExternalBrowser:true}),20000,'LIFF_INIT_TIMEOUT');
-    }
+  function updateSubmitState(){
+    submitButton.disabled=submitting||completed||!lineReady||!availabilityReady;
+    if(submitting||completed)return;
+    if(!lineReady)submitButton.textContent='LINE接続を確認しています…';
+    else if(!availabilityReady)submitButton.textContent='日程・クラスを確認しています…';
+    else updateReceptionMode();
+  }
+  function loadLiffSdk(){
+    if(window.liff)return Promise.resolve();
+    if(sdkPromise)return sdkPromise;
+    sdkPromise=new Promise((resolve,reject)=>{
+      const script=document.createElement('script');
+      function finish(error){
+        script.onload=null;script.onerror=null;
+        if(error){script.remove();reject(error)}else resolve();
+      }
+      script.src='https://static.line-scdn.net/liff/edge/2/sdk.js';
+      script.async=true;
+      script.onload=()=>finish(window.liff?null:new Error('LIFF_SDK_NOT_LOADED'));
+      script.onerror=()=>finish(new Error('LIFF_SDK_NOT_LOADED'));
+      // The connection watchdog reports slowness; it never injects a second pending SDK.
+      document.head.appendChild(script);
+    }).catch(error=>{sdkPromise=null;throw error});
+    return sdkPromise;
+  }
+  function connectLine(){
+    if(lineTask||lineReady||completed)return lineTask;
+    retryLineButton.classList.add('hidden');
+    setPhase(lineStatus,'LINEに接続しています。先にお子さまの情報を入力できます。','loading');
+    const slow=setTimeout(()=>setPhase(lineStatus,'LINE接続を確認中です。入力を進めながらお待ちください。','loading'),4000);
+    const delayed=setTimeout(()=>setPhase(lineStatus,'LINEの応答が遅れています。接続でき次第、自動で続行します。解消しない場合はLINEの体験予約から開き直してください。','error'),12000);
+    lineTask=(async()=>{
+      try{
+        await loadLiffSdk();markPhase('sdk-ready');
+        // A timed-out Promise does not cancel liff.init. Keep exactly one pending init.
+        await liff.init({liffId:CONFIG.liffId});
+        markPhase('line-initialized');
+        const resolvedRoute=getRoute();
+        if(resolvedRoute&&resolvedRoute!==routeKey){routeKey=resolvedRoute;prepareForm();loadAvailability()}
+        if(!routeKey)throw new Error('INVALID_ROUTE');
+        const context=liff.getContext();
+        if(!liff.isInClient()||!liff.isLoggedIn()||!context||context.type!=='utou')throw new Error('OPEN_FROM_OFFICIAL_ACCOUNT_CHAT');
+        idToken=liff.getIDToken();
+        if(!idToken)throw new Error('MISSING_ID_TOKEN');
+        // Receipt permission is checked on submit and again when sending the receipt.
+        lineReady=true;lineStatus.classList.add('hidden');markPhase('line-ready');
+      }catch(error){
+        lineReady=false;
+        const message=error&&error.message;
+        setPhase(lineStatus,message==='OPEN_FROM_OFFICIAL_ACCOUNT_CHAT'?'LINE公式アカウントのトークから「体験予約」を開いてください。':message==='INVALID_ROUTE'?'会場を確認できませんでした。LINEの「体験予約」から開き直してください。':'LINEに接続できませんでした。入力は残っています。接続を再試行してください。','error');
+        if(!['OPEN_FROM_OFFICIAL_ACCOUNT_CHAT','INVALID_ROUTE'].includes(message))retryLineButton.classList.remove('hidden');
+      }finally{
+        clearTimeout(slow);clearTimeout(delayed);lineTask=null;updateSubmitState();
+      }
+    })();
+    return lineTask;
+  }
+  function prepareForm(){
+    document.getElementById('venueName').textContent=CONFIG.routes[routeKey].venue;
+    if(!childrenArea.children.length)addChild();
+    if(preparedRoute!==routeKey){preparedRoute=routeKey;restoreDraft()}
+    form.classList.remove('hidden');markPhase('form-visible');
+  }
+  // A LIFF primary-to-secondary redirect can replace the document while the user types.
+  // Only unsent input is kept in this tab for at most 30 minutes; never tokens or receipts.
+  function draftKey(){return 'prospect:reservation-draft:v1:'+routeKey}
+  function clearDraft(){try{sessionStorage.removeItem(draftKey())}catch(_){}}
+  function saveDraft(){
+    if(!routeKey||completed||pendingRequestId)return;
+    try{sessionStorage.setItem(draftKey(),JSON.stringify({savedAt:Date.now(),children:collectChildren(),referrer:document.getElementById('referrer').value,notes:document.getElementById('notes').value}))}catch(_){}
+  }
+  function restoreDraft(){
+    try{
+      const raw=sessionStorage.getItem(draftKey());if(!raw)return;
+      const draft=JSON.parse(raw);clearDraft();
+      if(!Number.isFinite(draft.savedAt)||draft.savedAt>Date.now()||Date.now()-draft.savedAt>1800000||!Array.isArray(draft.children)||!draft.children.length||draft.children.length>MAX_CHILDREN)return;
+      childrenArea.textContent='';
+      draft.children.forEach(child=>{addChild();const card=childrenArea.lastElementChild;card.querySelector('.child-name').value=String(child.name||'').slice(0,50);card.querySelector('.child-kana').value=String(child.kana||'').slice(0,50);card.querySelector('.child-grade').value=CONFIG.grades.includes(child.grade)?child.grade:''});
+      document.getElementById('referrer').value=String(draft.referrer||'').slice(0,80);document.getElementById('notes').value=String(draft.notes||'').slice(0,300);
+    }catch(_){clearDraft()}
+  }
+  function loadAvailability(){
+    if(availabilityTask||!routeKey||completed)return availabilityTask;
+    const requestedRoute=routeKey;
+    availabilityReady=false;classSelect.disabled=true;updateSubmitState();
+    retryAvailabilityButton.classList.add('hidden');
+    setPhase(availabilityStatus,'日程・クラスを確認しています。お子さまの情報は先に入力できます。','loading');
+    availabilityTask=(async()=>{
+      try{
+        const data=await postJson('/api/reservations/availability',{route:requestedRoute},{attempts:1,timeoutMs:10000});
+        if(routeKey!==requestedRoute)return;
+        availabilityReady=showForm(data);classSelect.disabled=!availabilityReady;
+        if(!availabilityReady){
+          setPhase(availabilityStatus,'現在、この会場の体験受付は停止しています。','loading');
+        }else if(data.fallback){
+          setPhase(availabilityStatus,'保存済みの日程を表示しています。送信時に最新の受付状況を確認します。','loading');
+        }else availabilityStatus.classList.add('hidden');
+        markPhase('availability-ready');
+      }catch(_){
+        if(routeKey!==requestedRoute)return;
+        setPhase(availabilityStatus,'日程・クラスを取得できませんでした。入力は残っています。通信を確認して再取得してください。','error');
+        retryAvailabilityButton.classList.remove('hidden');
+      }finally{
+        availabilityTask=null;
+        if(routeKey!==requestedRoute)loadAvailability();
+        else updateSubmitState();
+      }
+    })();
+    return availabilityTask;
   }
   function liffErrorText(error){
     const code=error&&error.code?String(error.code):'';
@@ -1307,6 +1423,8 @@ function buildReservationHtml_(liffId) {
   }
   function successMessage(type){return type==='waitlist'?'空きが出ましたら、キャンセル待ちの申込順にLINEでご案内します。空きが出るまでは体験には参加できません。':'担当スタッフが内容を確認後、こちらからLINEいたしますので、しばらくお待ちください。'}
   function showReservationSuccess(data,chatSent,type){
+    lineStatus.classList.add('hidden');availabilityStatus.classList.add('hidden');
+    retryLineButton.classList.add('hidden');retryAvailabilityButton.classList.add('hidden');
     statusBox.classList.add('hidden');
     form.classList.add('hidden');
     document.getElementById('success').classList.remove('hidden');
@@ -1321,26 +1439,56 @@ function buildReservationHtml_(liffId) {
       closeButton.classList.add('hidden');
     }
   }
-  function showForm(availability){const route=CONFIG.routes[routeKey];document.getElementById('venueName').textContent=route.venue;const classes=availability&&Array.isArray(availability.classes)?availability.classes:[];const selectable=classes.some(item=>item&&['open','waitlist'].includes(item.status));if(!selectable){form.classList.add('hidden');setStatus('現在、この会場の体験受付は停止しています。','error');return false}fillClassSelect(classes);currentFixedClass=availability&&CONFIG.classes.includes(availability.fixedClass)?availability.fixedClass:'';if(currentFixedClass){classSelect.value=currentFixedClass;const selected=classSelect.selectedOptions[0];classField.classList.add('hidden');classSelect.required=false;fixedClassTime.textContent=selected&&selected.dataset.time?selected.dataset.time:selectedClassDisplay();fixedClassField.classList.remove('hidden')}else{classField.classList.remove('hidden');classSelect.required=true;fixedClassField.classList.add('hidden');fixedClassTime.textContent=''}fillDateSelect(availability&&Array.isArray(availability.dates)?availability.dates:[]);if(!childrenArea.children.length)addChild();updateReceptionMode();statusBox.classList.add('hidden');form.classList.remove('hidden');if(!lineReady){submitButton.disabled=true;submitButton.textContent='LINE接続を確認しています…'}else{submitButton.disabled=false;updateReceptionMode()}return true}
+  function showForm(availability){
+    const classes=availability&&Array.isArray(availability.classes)?availability.classes:[];
+    const selectable=classes.some(item=>item&&['open','waitlist'].includes(item.status));
+    const oldClass=classSelect.value;const oldDate=dateSelect.value;
+    fillClassSelect(classes);
+    currentFixedClass=availability&&CONFIG.classes.includes(availability.fixedClass)?availability.fixedClass:'';
+    if(currentFixedClass){
+      classSelect.value=currentFixedClass;const selected=classSelect.selectedOptions[0];
+      classField.classList.add('hidden');classSelect.required=false;
+      fixedClassTime.textContent=selected&&selected.dataset.time?selected.dataset.time:selectedClassDisplay();
+      fixedClassField.classList.remove('hidden');
+    }else{
+      classField.classList.remove('hidden');classSelect.required=true;
+      fixedClassField.classList.add('hidden');fixedClassTime.textContent='';
+      if(classes.some(item=>item.value===oldClass&&item.status!=='closed'))classSelect.value=oldClass;
+    }
+    fillDateSelect(availability&&Array.isArray(availability.dates)?availability.dates:[]);
+    if(availableDates.some(item=>item.value===oldDate))dateSelect.value=oldDate;
+    updateReceptionMode();form.classList.remove('hidden');
+    return selectable;
+  }
   addChildButton.addEventListener('click',()=>addChild());
-  classSelect.addEventListener('change',()=>updateReceptionMode());
+  classSelect.addEventListener('change',()=>{updateReceptionMode();updateSubmitState()});
   form.addEventListener('submit',async event=>{
-    event.preventDefault();if(!form.reportValidity())return;
+    event.preventDefault();
+    if(submitting||completed||!lineReady||!availabilityReady||!form.reportValidity())return;
     idToken=liff.getIDToken()||idToken;
     const receptionType=selectedClassStatus()==='waitlist'?'waitlist':'reservation';
     const reservationData={route:routeKey,receptionType:receptionType,experienceDate:receptionType==='waitlist'?'':dateSelect.value,className:classSelect.value,children:collectChildren(),referrer:document.getElementById('referrer').value,notes:document.getElementById('notes').value};
     const payloadKey=JSON.stringify(reservationData);
     if(!pendingRequestId||pendingPayloadKey!==payloadKey){pendingRequestId=requestId();pendingPayloadKey=payloadKey}
+    clearDraft();
     const payload=Object.assign({idToken:idToken,requestId:pendingRequestId},reservationData);
-    pendingReceptionType=receptionType;submitButton.disabled=true;submitButton.textContent=receptionType==='waitlist'?'申し込んでいます…':'予約しています…';statusBox.classList.add('hidden');
+    pendingReceptionType=receptionType;submitting=true;submitButton.disabled=true;submitButton.textContent=receptionType==='waitlist'?'申し込んでいます…':'予約しています…';statusBox.classList.add('hidden');
     try{
+      // Keep the existing receipt requirement, outside the page-opening critical path.
+      const permission=await withTimeout(liff.permission.query('chat_message.write'),12000,'CHAT_MESSAGE_PERMISSION_TIMEOUT');
+      if(!permission||permission.state!=='granted')throw new Error(permission&&permission.state==='unavailable'?'CHAT_MESSAGE_SCOPE_NOT_CONFIGURED':'CHAT_MESSAGE_PERMISSION_REQUIRED');
       const data=await postJson('/api/reservations',payload,{attempts:1,timeoutMs:95000});
+      completed=true;
       pendingChatMessage=buildReservationChatMessage(payload);let chatSent=false;
       try{await sendReservationToChat(pendingChatMessage);chatSent=true}catch(chatError){console.error('Reservation chat message failed',chatError)}
       showReservationSuccess(data,chatSent,receptionType);
     }catch(e){
       console.error('Reservation submission failed',e);
       const code=e&&e.message?String(e.message):'';
+      submitting=false;
+      if(code==='CHAT_MESSAGE_PERMISSION_TIMEOUT'||code==='CHAT_MESSAGE_SCOPE_NOT_CONFIGURED'||code==='CHAT_MESSAGE_PERMISSION_REQUIRED'){
+        setStatus('予約はまだ送信されていません。'+liffErrorText(e),'error');updateSubmitState();return;
+      }
       if(code==='class_status_changed'||code==='class_closed'){setStatus('クラスの受付状況が変更されました。画面を閉じて、もう一度「体験予約」を開いてください。\\n'+liffErrorText(e),'error');submitButton.disabled=true;return}
       setStatus('通信が安定せず、受付完了を確認できませんでした。入力内容は残っていますので、下のボタンをもう一度押してください。\\n確認用番号：FORM-'+pendingRequestId,'error');
       submitButton.disabled=false;submitButton.textContent=receptionType==='waitlist'?'同じ内容でもう一度確認する':'同じ内容でもう一度確認する';
@@ -1348,54 +1496,19 @@ function buildReservationHtml_(liffId) {
   });
   retryChatButton.addEventListener('click',async()=>{if(!pendingChatMessage)return;retryChatButton.disabled=true;retryChatButton.textContent='LINEへ送信しています…';try{await sendReservationToChat(pendingChatMessage);chatStatus.textContent=successMessage(pendingReceptionType);retryChatButton.classList.add('hidden');closeButton.classList.remove('hidden')}catch(e){chatStatus.textContent='LINEへの送信が完了していません。画面を閉じず、もう一度お試しください。';retryChatButton.disabled=false;retryChatButton.textContent='LINEのトークへ送信する'}});
   closeButton.addEventListener('click',()=>{if(window.liff&&liff.isInClient())liff.closeWindow();else location.href='about:blank'});
-  (async()=>{
-    const progressTimers=[];
-    try{
-      if(!window.liff)throw new Error('LIFF_SDK_NOT_LOADED');
-      routeKey=getRoute();
-      if(!routeKey)throw new Error('INVALID_ROUTE');
+  retryLineButton.addEventListener('click',()=>connectLine());
+  retryAvailabilityButton.addEventListener('click',()=>loadAvailability());
+  window.addEventListener('pagehide',()=>saveDraft());
+  window.addEventListener('online',()=>{
+    if(!lineReady&&!retryLineButton.classList.contains('hidden'))connectLine();
+    if(!availabilityReady&&!retryAvailabilityButton.classList.contains('hidden'))loadAvailability();
+  });
+  routeKey=getRoute();
+  if(routeKey){prepareForm();loadAvailability()}
+  else{form.classList.add('hidden');setPhase(availabilityStatus,'会場情報を確認しています。','loading')}
+  // Both tasks start in the same turn. No profile/permission/GAS read gates the shell.
+  connectLine();
 
-      // 安定性を優先し、LINE初期化・本人状態確認を完了してから会場情報を取得します。
-      // フォームは両方が完了するまで表示しません。
-      startLineProgress(progressTimers);
-      await initializeLiffWithRetry();
-      if(!liff.isLoggedIn()){
-        clearProgressTimers(progressTimers);
-        liff.login({redirectUri:location.href});
-        return;
-      }
-      idToken=liff.getIDToken();
-      if(!idToken)throw new Error('MISSING_ID_TOKEN');
-      const context=liff.getContext();
-      if(!liff.isInClient()||!context||context.type!=='utou')throw new Error('OPEN_FROM_OFFICIAL_ACCOUNT_CHAT');
-
-      // 権限は初期表示時に確認します。LINE側の確認通信だけがタイムアウトした場合は
-      // フォーム表示を妨げず、控え送信直前に必ず再確認します。
-      let permission=null;
-      try{
-        permission=await withTimeout(liff.permission.query('chat_message.write'),12000,'CHAT_MESSAGE_PERMISSION_TIMEOUT');
-      }catch(permissionError){
-        console.warn('Initial chat_message.write check delayed',permissionError);
-      }
-      if(permission&&permission.state!=='granted'){
-        throw new Error(permission.state==='unavailable'?'CHAT_MESSAGE_SCOPE_NOT_CONFIGURED':'CHAT_MESSAGE_PERMISSION_REQUIRED');
-      }
-      lineReady=true;
-
-      startAvailabilityProgress(progressTimers);
-      const availability=await postJson('/api/reservations/availability',{route:routeKey},{attempts:1,timeoutMs:55000});
-      clearProgressTimers(progressTimers);
-      if(!showForm(availability))return;
-      submitButton.disabled=false;
-      updateReceptionMode();
-    }catch(e){
-      clearProgressTimers(progressTimers);
-      form.classList.add('hidden');
-      const detail=liffErrorText(e);
-      setStatus('予約画面を開けませんでした。\\nエラー：'+detail+'\\n画面を閉じて、LINEの「体験予約」をもう一度押してください。','error');
-      console.error('LIFF initialization failed',e);
-    }
-  })();
 </script>
 </body>
 </html>`;
