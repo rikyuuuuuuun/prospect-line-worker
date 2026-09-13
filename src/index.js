@@ -59,18 +59,15 @@ const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 // 活動申込は全会場共通URLで使います。GAS転送時だけ既存の有効ルートを内部利用します。
 const ACTIVITY_GAS_ROUTE = 'a/saitama-shibakawa';
 const ACTIVITY_LIFF_ID = '2011040394-O4z7w36C';
-const WORKER_BUILD = '2026-09-13-reservation-progressive-startup';
-const WORKER_RELEASE = '2026-09-13-reservation-progressive-startup';
+const WORKER_BUILD = '2026-09-13-reservation-fast-submit';
+const WORKER_RELEASE = '2026-09-13-reservation-fast-submit';
 const RESERVATION_READ_BUDGET_MS = 8000;
 const EXPECTED_GAS_BUILD = '2026-08-13-single-slot-auto1';
-const RESERVATION_UPSTREAM_MAX_AGE_MS = 900000;
-// 体験予約の公開情報（開催日・クラス・時間）だけをCloudflare側で短時間キャッシュします。
-// LINE本人確認は予約保存時に必ず実施し、初期表示では外部のLINE検証APIを待たない設計です。
-const RESERVATION_AVAILABILITY_EDGE_FRESH_MS = 180000;
-const RESERVATION_AVAILABILITY_EDGE_STALE_MS = 3600000;
-// GASのHTTP入口だけが一時失敗した場合に限り、同じCache API内の最終正常値を最大24時間まで退避利用します。
-// 予約保存前はWorkerからGASの最新日程・クラスを再取得し、古い表示だけで予約を確定させません。
-const RESERVATION_AVAILABILITY_EDGE_EMERGENCY_MS = 86400000;
+// Owner-approved policy: public dates/class states may lag by up to 24 hours.
+// Original generation time bounds both the edge cache and signed form policy.
+// Identity verification and durable reservation storage remain synchronous.
+const RESERVATION_UPSTREAM_MAX_AGE_MS = 86400000;
+const RESERVATION_POLICY_PURPOSE = 'prospect-reservation-policy-v1';
 const GRADES = Object.freeze([
   '年少', '年中', '年長', '1年生', '2年生', '3年生',
   '4年生', '5年生', '6年生',
@@ -184,7 +181,7 @@ function reservationAvailabilityResponse_(payload, cachedAt) {
     status: 200,
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      // 3分を超えたら更新し、通常は1時間まで利用します。1〜24時間は通信障害時だけの退避値です。
+      // Internal cache only; original generatedAt, not cache insertion, bounds validity.
       'cache-control': 'public, max-age=86400',
       'x-content-type-options': 'nosniff',
       'x-prospect-cached-at': String(cachedAt || Date.now()),
@@ -198,9 +195,8 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh, 
   });
   // 初期表示は専用の有限リトライを使います。GASの正常応答を待てる長さを確保しつつ、
   // 無限待機やブラウザ側からの多重送信を避けます。
-  const result = forceRefresh && !deadlineAt
-    ? await forwardToGas_(env, routeKey, requestBody)
-    : await forwardAvailabilityToGas_(env, routeKey, requestBody, deadlineAt);
+  const deadline = deadlineAt || Date.now() + RESERVATION_READ_BUDGET_MS;
+  const result = await forwardAvailabilityToGas_(env, routeKey, requestBody, deadline);
   if (!result) throw new Error('gas_empty_response');
   if (result.ok === false) throw new Error(mapGasRejection_(result.message));
   if (!Array.isArray(result.dates)) throw new Error('gas_wrong_or_old_backend');
@@ -208,7 +204,7 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh, 
   // Unverifiable/old snapshots require one bounded live refresh; they never
   // become fresh merely because this Worker received them again.
   if (!forceRefresh && !isVerifiedUpstreamAvailabilityAge_(result)) {
-    return loadReservationAvailabilityPayload_(env, routeKey, true, deadlineAt);
+    return loadReservationAvailabilityPayload_(env, routeKey, true, deadline);
   }
   if (!isVerifiedUpstreamAvailabilityAge_(result) || (forceRefresh && result.fallback)) {
     throw new Error('availability_unverified_fallback');
@@ -257,21 +253,7 @@ function isVerifiedUpstreamAvailabilityAge_(result) {
   const generatedAt = result && result.generatedAt;
   return typeof generatedAt === 'number' && Number.isFinite(generatedAt) &&
     generatedAt > 0 && generatedAt <= Date.now() &&
-    Date.now() - generatedAt <= RESERVATION_UPSTREAM_MAX_AGE_MS;
-}
-
-async function refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey) {
-  try {
-    // Edge拠点ごとの更新が同時発生しても、GASの5分キャッシュを迂回してSpreadsheetへ集中しないようにします。
-    const payload = await loadReservationAvailabilityPayload_(env, routeKey, false, Date.now() + RESERVATION_READ_BUDGET_MS);
-    if (payload.fallback) return; // Never renew the age of an upstream fallback.
-    const response = reservationAvailabilityResponse_(payload, payload.generatedAt);
-    if (typeof caches !== 'undefined' && caches.default) {
-      await caches.default.put(cacheKey, response.clone());
-    }
-  } catch (error) {
-    console.error('Reservation availability background refresh failed', String(error && error.message || error));
-  }
+    Date.now() - generatedAt < RESERVATION_UPSTREAM_MAX_AGE_MS;
 }
 
 // Cache API is an optional accelerator. Its failures must not discard a valid read.
@@ -296,6 +278,48 @@ function availabilityDeliveryResponse_(response, cacheState, startedAt) {
   return new Response(response.body, { status: response.status, headers });
 }
 
+async function reservationPolicyKey_(env) {
+  if (!env.GAS_FORWARD_KEY) throw new Error('gas_not_configured');
+  return crypto.subtle.importKey('raw', new TextEncoder().encode(env.GAS_FORWARD_KEY),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+
+async function signReservationPolicy_(env, routeKey, availability) {
+  if (!isVerifiedUpstreamAvailabilityAge_(availability)) throw new Error('availability_policy_expired');
+  const payload = JSON.stringify({
+    route: routeKey, generatedAt: availability.generatedAt,
+    dates: availability.dates.map(item => item.value),
+    classes: availability.classes.map(item => ({ value: item.value, status: item.status })),
+    fixedClass: availability.fixedClass || '',
+  });
+  const bytes = new TextEncoder().encode(RESERVATION_POLICY_PURPOSE + '\n' + payload);
+  const signature = await crypto.subtle.sign('HMAC', await reservationPolicyKey_(env), bytes);
+  return { payload, signature: Array.from(new Uint8Array(signature), b => b.toString(16).padStart(2, '0')).join('') };
+}
+
+async function readReservationPolicy_(env, routeKey, proof) {
+  if (!proof || typeof proof.payload !== 'string' || proof.payload.length > 8000 ||
+      typeof proof.signature !== 'string' || !/^[0-9a-f]{64}$/.test(proof.signature)) throw new Error('invalid_availability_policy');
+  const signature = Uint8Array.from(proof.signature.match(/../g), byte => parseInt(byte, 16));
+  const bytes = new TextEncoder().encode(RESERVATION_POLICY_PURPOSE + '\n' + proof.payload);
+  if (!await crypto.subtle.verify('HMAC', await reservationPolicyKey_(env), signature, bytes)) throw new Error('invalid_availability_policy');
+  let policy;
+  try { policy = JSON.parse(proof.payload); } catch (_) { throw new Error('invalid_availability_policy'); }
+  if (!policy || policy.route !== routeKey || !Array.isArray(policy.dates) || !Array.isArray(policy.classes)) throw new Error('invalid_availability_policy');
+  if (!isVerifiedUpstreamAvailabilityAge_(policy)) throw new Error('availability_policy_expired');
+  return policy;
+}
+
+async function deliverReservationAvailability_(payload, env, routeKey, state, startedAt) {
+  // A day-old snapshot may contain yesterday's date; never offer a past date.
+  payload = { ...payload, dates: payload.dates.filter(item => isBookableDate_(item.value)) };
+  // The proof contains only public policy. It is usable across edge locations and
+  // authenticates the displayed policy without another GAS read when submitting.
+  const proof = await signReservationPolicy_(env, routeKey, payload);
+  return availabilityDeliveryResponse_(json_({ ...payload, availabilityProof: proof,
+    policyExpiresAt: payload.generatedAt + RESERVATION_UPSTREAM_MAX_AGE_MS }, 200), state, startedAt);
+}
+
 async function handleReservationAvailability_(request, env, ctx) {
   const startedAt = Date.now();
   try {
@@ -303,54 +327,24 @@ async function handleReservationAvailability_(request, env, ctx) {
     const routeKey = requireRoute_(body.route);
     const cacheKey = reservationAvailabilityCacheKey_(request, routeKey);
     const cached = await readAvailabilityCache_(cacheKey);
-    let emergencyCached = null;
     if (cached) {
-      const cachedAt = Number(cached.headers.get('x-prospect-cached-at') || 0);
-      const age = cachedAt > 0 && cachedAt <= Date.now() ? Date.now() - cachedAt : Number.MAX_SAFE_INTEGER;
-      if (age <= RESERVATION_AVAILABILITY_EDGE_FRESH_MS) {
-        return availabilityDeliveryResponse_(cached, 'HIT', startedAt);
+      let payload;
+      try { payload = await cached.json(); } catch (_) {}
+      if (payload && payload.ok === true && Array.isArray(payload.dates) &&
+          Array.isArray(payload.classes) && payload.classes.length && isVerifiedUpstreamAvailabilityAge_(payload)) {
+        return await deliverReservationAvailability_(payload, env, routeKey, 'HIT', startedAt);
       }
-      if (age <= RESERVATION_AVAILABILITY_EDGE_STALE_MS) {
-        if (ctx && typeof ctx.waitUntil === 'function') {
-          ctx.waitUntil(refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey));
-        }
-        return availabilityDeliveryResponse_(await emergencyReservationAvailabilityResponse_(cached), 'STALE', startedAt);
-      }
-      if (age <= RESERVATION_AVAILABILITY_EDGE_EMERGENCY_MS) emergencyCached = cached;
     }
-
-    let payload;
-    try {
-      // One total budget includes retries, response bodies and an age-verification refresh.
-      payload = await loadReservationAvailabilityPayload_(env, routeKey, false, startedAt + RESERVATION_READ_BUDGET_MS);
-    } catch (error) {
-      if (emergencyCached && isTransientAvailabilityError_(error)) {
-        return availabilityDeliveryResponse_(await emergencyReservationAvailabilityResponse_(emergencyCached), 'EMERGENCY', startedAt);
-      }
-      throw error;
-    }
-    const response = reservationAvailabilityResponse_(payload, payload.generatedAt);
+    const payload = await loadReservationAvailabilityPayload_(env, routeKey, false, startedAt + RESERVATION_READ_BUDGET_MS);
     if (!payload.fallback) {
-      const write = storeAvailabilityCache_(cacheKey, response.clone());
+      const write = storeAvailabilityCache_(cacheKey, reservationAvailabilityResponse_(payload, payload.generatedAt));
       if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(write);
       else await write;
-    } else if (ctx && typeof ctx.waitUntil === 'function') {
-      ctx.waitUntil(refreshReservationAvailabilityEdgeCache_(env, routeKey, cacheKey));
     }
-    return availabilityDeliveryResponse_(response, payload.fallback ? 'FALLBACK' : 'MISS', startedAt);
+    return await deliverReservationAvailability_(payload, env, routeKey, payload.fallback ? 'FALLBACK' : 'MISS', startedAt);
   } catch (error) {
     return availabilityDeliveryResponse_(reservationError_(error), 'ERROR', startedAt);
   }
-}
-
-async function emergencyReservationAvailabilityResponse_(cached) {
-  const payload = await cached.json();
-  if (!payload || payload.ok !== true || !Array.isArray(payload.dates) || !Array.isArray(payload.classes) || !payload.classes.length) {
-    throw new Error('gas_unreachable');
-  }
-  payload.fallback = true;
-  payload.edgeFallback = true;
-  return json_(payload, 200);
 }
 
 function isTransientAvailabilityError_(error) {
@@ -413,12 +407,34 @@ function mapGasRejection_(message) {
 }
 
 async function handleReservationSubmit_(request, env) {
+  const startedAt = Date.now();
+  let identityMs = 0, policyMs = 0, storageMs = 0;
+  function timed(response) {
+    response.headers.set('server-timing', 'identity;dur=' + identityMs + ', policy;dur=' + policyMs + ', storage;dur=' + storageMs + ', submit;dur=' + (Date.now() - startedAt));
+    return response;
+  }
   try {
     const body = await readJsonBody_(request);
     const routeKey = requireRoute_(body.route);
-    const identity = await verifyLineIdToken_(body.idToken, env);
     const reservation = validateReservation_(body, routeKey);
-    await verifyReservationAvailabilityBeforeSubmit_(env, routeKey, reservation);
+    let phaseAt = Date.now();
+    const identity = await verifyLineIdToken_(body.idToken, env);
+    identityMs = Date.now() - phaseAt;
+    phaseAt = Date.now();
+    let proof = body.availabilityProof;
+    // Compatibility for HTML opened before this deployment. This uses the same
+    // bounded public cache, never the old forced live reread on every submission.
+    if (proof === undefined) {
+      const read = await handleReservationAvailability_(new Request(request.url, {
+        method: 'POST', body: JSON.stringify({ route: routeKey }),
+      }), env, {});
+      const availability = await read.json();
+      if (!read.ok || !availability.ok) throw new Error(availability.message || 'gas_unreachable');
+      proof = availability.availabilityProof;
+    }
+    await verifyReservationAvailabilityBeforeSubmit_(env, routeKey, reservation, proof);
+    policyMs = Date.now() - phaseAt;
+    phaseAt = Date.now();
     const result = await forwardToGas_(env, routeKey, JSON.stringify({
       source: 'reservation_form',
       requestId: reservation.requestId,
@@ -431,28 +447,29 @@ async function handleReservationSubmit_(request, env) {
       referrer: reservation.referrer,
       notes: reservation.notes,
     }), 2);
-    if (!result) throw new Error('gas_empty_response');
-    if (result.ok === false) throw new Error(mapGasReservationError_(result.message));
-    return json_({
+    storageMs = Date.now() - phaseAt;
+    if (!result || result.ok !== true) throw new Error(result ? mapGasReservationError_(result.message) : 'gas_empty_response');
+    return timed(json_({
       ok: true,
       receiptId: safeSingleLine_(result.receiptId, 100),
       duplicate: Boolean(result.duplicate),
       childCount: reservation.children.length,
       receptionType: reservation.receptionType,
-    }, 200);
+    }, 200));
   } catch (error) {
-    return reservationError_(error);
+    return timed(reservationError_(error));
   }
 }
 
-async function verifyReservationAvailabilityBeforeSubmit_(env, routeKey, reservation) {
-  const availability = await loadReservationAvailabilityPayload_(env, routeKey, true);
+async function verifyReservationAvailabilityBeforeSubmit_(env, routeKey, reservation, proof) {
+  const availability = await readReservationPolicy_(env, routeKey, proof);
+  if (availability.fixedClass && availability.fixedClass !== reservation.className) throw new Error('invalid_class');
   const selected = availability.classes.find(function (item) { return item.value === reservation.className; });
   if (!selected || selected.status === 'closed') throw new Error('class_closed');
   const expected = reservation.receptionType === 'waitlist' ? 'waitlist' : 'open';
   if (selected.status !== expected) throw new Error('class_status_changed');
   if (reservation.receptionType === 'reservation' && !availability.dates.some(function (item) {
-    return item.value === reservation.experienceDate;
+    return item === reservation.experienceDate;
   })) throw new Error('selected_date_unavailable');
 }
 
@@ -902,6 +919,8 @@ async function forwardToGas_(env, routeKey, body, maxAttempts) {
   forwardUrl.searchParams.set('route', routeKey);
   let lastError = new Error('gas_unreachable');
   let lastResult = null;
+  let reservationWrite = false;
+  try { reservationWrite = JSON.parse(body).source === 'reservation_form'; } catch (_) {}
   const attemptLimit = Math.max(1, Math.min(3, Number(maxAttempts) || 3));
   for (let attempt = 0; attempt < attemptLimit; attempt += 1) {
     try {
@@ -910,13 +929,13 @@ async function forwardToGas_(env, routeKey, body, maxAttempts) {
         headers: { 'content-type': 'application/json' },
         body: body,
         redirect: 'follow',
-      }, 25000);
+      }, 25000, reservationWrite);
       if (!response.ok) {
         lastError = gasHttpError_(response, 'gas_forward', attempt + 1, false);
       } else {
         const text = await response.text();
         try {
-          lastResult = text ? JSON.parse(text) : { ok: true };
+          lastResult = text ? JSON.parse(text) : (reservationWrite ? null : { ok: true });
         } catch (parseError) {
           lastError = new Error('gas_invalid_json');
           lastResult = null;
@@ -1016,11 +1035,15 @@ function gasHttpError_(response, operation, attempt, includeStatus) {
   return error;
 }
 
-async function fetchWithTimeout_(url, init, timeoutMs) {
+async function fetchWithTimeout_(url, init, timeoutMs, bufferBody) {
   const controller = new AbortController();
   const timer = setTimeout(function () { controller.abort(); }, timeoutMs);
   try {
-    return await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+    const response = await fetch(url, Object.assign({}, init, { signal: controller.signal }));
+    if (!bufferBody) return response;
+    // Reservation storage needs a complete acknowledgement inside the timeout.
+    const body = await response.text();
+    return new Response(body, { status: response.status, headers: response.headers });
   } catch (error) {
     if (error && error.name === 'AbortError') throw new Error('upstream_timeout');
     throw error;
@@ -1105,10 +1128,10 @@ function reservationError_(error) {
   const badRequestCodes = [
     'invalid_request_id', 'invalid_route', 'invalid_children', 'invalid_child_name', 'invalid_grade',
     'invalid_class', 'invalid_reception_type', 'invalid_experience_date', 'selected_date_unavailable',
-    'request_too_large', 'invalid_request', 'invalid_json',
+    'request_too_large', 'invalid_request', 'invalid_json', 'invalid_availability_policy',
   ];
   const unauthorizedCodes = ['invalid_line_identity', 'line_login_not_configured'];
-  const conflictCodes = ['class_status_changed', 'class_closed'];
+  const conflictCodes = ['class_status_changed', 'class_closed', 'availability_policy_expired'];
   const status = badRequestCodes.indexOf(code) !== -1 ? 400 :
     (conflictCodes.indexOf(code) !== -1 ? 409 :
     (unauthorizedCodes.indexOf(code) !== -1 ? 401 : 502));
@@ -1224,6 +1247,7 @@ function buildReservationHtml_(liffId) {
   const MAX_CHILDREN=6;
   let sdkPromise=null;let lineTask=null;let availabilityTask=null;
   let availabilityReady=false;let submitting=false;let completed=false;let preparedRoute='';
+  let availabilityProof=null;let policyExpiresAt=0;let receiptTask=null;let receiptSent=false;
   let routeKey='';let idToken='';let lineReady=false;let pendingRequestId='';let pendingPayloadKey='';let pendingChatMessage='';let pendingReceptionType='reservation';let availableDates=[];let currentFixedClass='';
 
   function routeFromUrl(url){
@@ -1289,7 +1313,7 @@ function buildReservationHtml_(liffId) {
         if(!liff.isInClient()||!liff.isLoggedIn()||!context||context.type!=='utou')throw new Error('OPEN_FROM_OFFICIAL_ACCOUNT_CHAT');
         idToken=liff.getIDToken();
         if(!idToken)throw new Error('MISSING_ID_TOKEN');
-        // Receipt permission is checked on submit and again when sending the receipt.
+        // Receipt delivery is independent of durable reservation acceptance.
         lineReady=true;lineStatus.classList.add('hidden');markPhase('line-ready');
       }catch(error){
         lineReady=false;
@@ -1336,11 +1360,12 @@ function buildReservationHtml_(liffId) {
       try{
         const data=await postJson('/api/reservations/availability',{route:requestedRoute},{attempts:1,timeoutMs:10000});
         if(routeKey!==requestedRoute)return;
+        availabilityProof=data.availabilityProof;policyExpiresAt=Number(data.policyExpiresAt)||0;
         availabilityReady=showForm(data);classSelect.disabled=!availabilityReady;
         if(!availabilityReady){
           setPhase(availabilityStatus,'現在、この会場の体験受付は停止しています。','loading');
         }else if(data.fallback){
-          setPhase(availabilityStatus,'保存済みの日程を表示しています。送信時に最新の受付状況を確認します。','loading');
+          setPhase(availabilityStatus,'保存済みの日程・受付状況を表示しています。','loading');
         }else availabilityStatus.classList.add('hidden');
         markPhase('availability-ready');
       }catch(_){
@@ -1414,30 +1439,43 @@ function buildReservationHtml_(liffId) {
     if(payload.notes)lines.push('相談・連絡事項：'+payload.notes);
     return lines.join('\\n').slice(0,5000);
   }
-  async function sendReservationToChat(message){
-    const context=liff.getContext();
-    if(!liff.isInClient()||!context||context.type!=='utou')throw new Error('OPEN_FROM_OFFICIAL_ACCOUNT_CHAT');
-    const permission=await withTimeout(liff.permission.query('chat_message.write'),12000,'CHAT_MESSAGE_PERMISSION_TIMEOUT');
-    if(!permission||permission.state!=='granted')throw new Error(permission&&permission.state==='unavailable'?'CHAT_MESSAGE_SCOPE_NOT_CONFIGURED':'CHAT_MESSAGE_PERMISSION_REQUIRED');
-    await withTimeout(liff.sendMessages([{type:'text',text:message}]),15000,'CHAT_MESSAGE_SEND_TIMEOUT');
+  function sendReservationToChat(message){
+    // Keep one receipt operation even if its UI watchdog fires; a timeout does
+    // not cancel LIFF sendMessages and must not cause duplicate receipts.
+    if(receiptSent)return Promise.resolve();
+    if(receiptTask)return receiptTask;
+    receiptTask=(async()=>{
+      const context=liff.getContext();
+      if(!liff.isInClient()||!context||context.type!=='utou')throw new Error('OPEN_FROM_OFFICIAL_ACCOUNT_CHAT');
+      const permission=await liff.permission.query('chat_message.write');
+      if(!permission||permission.state!=='granted')throw new Error('CHAT_MESSAGE_PERMISSION_REQUIRED');
+      await liff.sendMessages([{type:'text',text:message}]);
+      receiptSent=true;markPhase('receipt-sent');
+    })().finally(()=>{receiptTask=null});
+    return receiptTask;
+  }
+  async function deliverReceipt(){
+    retryChatButton.classList.add('hidden');
+    chatStatus.textContent='受付済みです。LINEのトークへ控えを送っています…';
+    const delayed=setTimeout(()=>{if(!receiptSent)chatStatus.textContent='受付済みです。LINEの控えの送信に時間がかかっています。予約を送り直す必要はありません。'},4000);
+    try{
+      await sendReservationToChat(pendingChatMessage);
+      chatStatus.textContent=successMessage(pendingReceptionType);
+      retryChatButton.classList.add('hidden');
+    }catch(_){
+      chatStatus.textContent='受付済みです。LINEの控えだけ送信できませんでした。下のボタンから控えを再送できます。';
+      retryChatButton.disabled=false;retryChatButton.textContent='LINEの控えを送信する';retryChatButton.classList.remove('hidden');
+    }finally{clearTimeout(delayed)}
   }
   function successMessage(type){return type==='waitlist'?'空きが出ましたら、キャンセル待ちの申込順にLINEでご案内します。空きが出るまでは体験には参加できません。':'担当スタッフが内容を確認後、こちらからLINEいたしますので、しばらくお待ちください。'}
-  function showReservationSuccess(data,chatSent,type){
+  function showReservationSuccess(data,type){
     lineStatus.classList.add('hidden');availabilityStatus.classList.add('hidden');
     retryLineButton.classList.add('hidden');retryAvailabilityButton.classList.add('hidden');
-    statusBox.classList.add('hidden');
-    form.classList.add('hidden');
+    statusBox.classList.add('hidden');form.classList.add('hidden');
     document.getElementById('success').classList.remove('hidden');
     successTitle.textContent=type==='waitlist'?'キャンセル待ちを受け付けました':'予約を受け付けました';
-    if(chatSent){
-      chatStatus.textContent=successMessage(type);
-      retryChatButton.classList.add('hidden');
-      closeButton.classList.remove('hidden');
-    }else{
-      chatStatus.textContent=(type==='waitlist'?'キャンセル待ち申込':'予約')+'は受け付け済みです。LINEのトークへの送信だけ完了していません。下のボタンを押してください。';
-      retryChatButton.classList.remove('hidden');
-      closeButton.classList.add('hidden');
-    }
+    retryChatButton.classList.add('hidden');closeButton.classList.remove('hidden');
+    markPhase('accepted-visible');
   }
   function showForm(availability){
     const classes=availability&&Array.isArray(availability.classes)?availability.classes:[];
@@ -1465,36 +1503,37 @@ function buildReservationHtml_(liffId) {
   form.addEventListener('submit',async event=>{
     event.preventDefault();
     if(submitting||completed||!lineReady||!availabilityReady||!form.reportValidity())return;
+    if(!availabilityProof||Date.now()>=policyExpiresAt){
+      setStatus('日程・受付状況を更新します。内容を確認して、もう一度送信してください。','loading');loadAvailability();return;
+    }
     idToken=liff.getIDToken()||idToken;
     const receptionType=selectedClassStatus()==='waitlist'?'waitlist':'reservation';
     const reservationData={route:routeKey,receptionType:receptionType,experienceDate:receptionType==='waitlist'?'':dateSelect.value,className:classSelect.value,children:collectChildren(),referrer:document.getElementById('referrer').value,notes:document.getElementById('notes').value};
     const payloadKey=JSON.stringify(reservationData);
     if(!pendingRequestId||pendingPayloadKey!==payloadKey){pendingRequestId=requestId();pendingPayloadKey=payloadKey}
     clearDraft();
-    const payload=Object.assign({idToken:idToken,requestId:pendingRequestId},reservationData);
+    const payload=Object.assign({idToken:idToken,requestId:pendingRequestId,availabilityProof:availabilityProof},reservationData);
     pendingReceptionType=receptionType;submitting=true;submitButton.disabled=true;submitButton.textContent=receptionType==='waitlist'?'申し込んでいます…':'予約しています…';statusBox.classList.add('hidden');
     try{
-      // Keep the existing receipt requirement, outside the page-opening critical path.
-      const permission=await withTimeout(liff.permission.query('chat_message.write'),12000,'CHAT_MESSAGE_PERMISSION_TIMEOUT');
-      if(!permission||permission.state!=='granted')throw new Error(permission&&permission.state==='unavailable'?'CHAT_MESSAGE_SCOPE_NOT_CONFIGURED':'CHAT_MESSAGE_PERMISSION_REQUIRED');
+      const receiptMessage=buildReservationChatMessage(payload);
+      markPhase('submit-start');
       const data=await postJson('/api/reservations',payload,{attempts:1,timeoutMs:95000});
-      completed=true;
-      pendingChatMessage=buildReservationChatMessage(payload);let chatSent=false;
-      try{await sendReservationToChat(pendingChatMessage);chatSent=true}catch(chatError){console.error('Reservation chat message failed',chatError)}
-      showReservationSuccess(data,chatSent,receptionType);
+      completed=true;markPhase('saved');
+      showReservationSuccess(data,receptionType);
+      pendingChatMessage=receiptMessage;
+      void deliverReceipt();
     }catch(e){
       console.error('Reservation submission failed',e);
       const code=e&&e.message?String(e.message):'';
       submitting=false;
-      if(code==='CHAT_MESSAGE_PERMISSION_TIMEOUT'||code==='CHAT_MESSAGE_SCOPE_NOT_CONFIGURED'||code==='CHAT_MESSAGE_PERMISSION_REQUIRED'){
-        setStatus('予約はまだ送信されていません。'+liffErrorText(e),'error');updateSubmitState();return;
+      if(['availability_policy_expired','invalid_availability_policy','invalid_experience_date','selected_date_unavailable','class_status_changed','class_closed'].includes(code)){
+        setStatus('日程・受付状況を更新します。内容を確認して、もう一度送信してください。','loading');loadAvailability();return;
       }
-      if(code==='class_status_changed'||code==='class_closed'){setStatus('クラスの受付状況が変更されました。画面を閉じて、もう一度「体験予約」を開いてください。\\n'+liffErrorText(e),'error');submitButton.disabled=true;return}
       setStatus('通信が安定せず、受付完了を確認できませんでした。入力内容は残っていますので、下のボタンをもう一度押してください。\\n確認用番号：FORM-'+pendingRequestId,'error');
       submitButton.disabled=false;submitButton.textContent=receptionType==='waitlist'?'同じ内容でもう一度確認する':'同じ内容でもう一度確認する';
     }
   });
-  retryChatButton.addEventListener('click',async()=>{if(!pendingChatMessage)return;retryChatButton.disabled=true;retryChatButton.textContent='LINEへ送信しています…';try{await sendReservationToChat(pendingChatMessage);chatStatus.textContent=successMessage(pendingReceptionType);retryChatButton.classList.add('hidden');closeButton.classList.remove('hidden')}catch(e){chatStatus.textContent='LINEへの送信が完了していません。画面を閉じず、もう一度お試しください。';retryChatButton.disabled=false;retryChatButton.textContent='LINEのトークへ送信する'}});
+  retryChatButton.addEventListener('click',()=>{if(pendingChatMessage&&!receiptTask&&!receiptSent)void deliverReceipt()});
   closeButton.addEventListener('click',()=>{if(window.liff&&liff.isInClient())liff.closeWindow();else location.href='about:blank'});
   retryLineButton.addEventListener('click',()=>connectLine());
   retryAvailabilityButton.addEventListener('click',()=>loadAvailability());

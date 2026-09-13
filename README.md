@@ -34,3 +34,7 @@ Do not move secret values into `wrangler.jsonc`, source code, or `.env` files co
 ## Deployment status
 
 GitHub-to-Cloudflare automatic deployment is enabled for the `main` branch.
+
+## Reservation performance
+
+See [submission redesign](docs/reservation-submit-redesign.md) for the current 24-hour public-policy freshness rule, signed validation and receipt delivery after durable acceptance. This supersedes the older forced live-policy check described in REPAIR-P06.md.
