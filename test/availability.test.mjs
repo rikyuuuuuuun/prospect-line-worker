@@ -38,11 +38,15 @@ test('expired, invalid or future origin cannot be rescued by new cache insertion
     assert.equal((await c.handleReservationAvailability_(request(),env,{})).status,502);
   }
 });
-test('fallback retains verified 24-hour origin and never writes cache',async()=>{
-  const c=setup(),generatedAt=Date.now()-7200000;let writes=0;
-  c.caches={default:{match:async()=>null,put:async()=>writes++}};c.forwardAvailabilityToGas_=async()=>good({fallback:true,generatedAt});
+test('fallback cache retains original expiry and prevents repeated GAS reads',async()=>{
+  const c=setup(),generatedAt=Date.now()-7200000;let writes=0,reads=0,saved;
+  c.caches={default:{match:async()=>saved?.clone(),put:async(_key,response)=>{writes++;saved=response}}};c.forwardAvailabilityToGas_=async()=>{reads++;return good({fallback:true,generatedAt})};
   const res=await c.handleReservationAvailability_(request(),env,{}),body=await res.json();
-  assert.equal(res.status,200);assert.equal(body.fallback,true);assert.equal(body.policyExpiresAt,generatedAt+86400000);assert.equal(writes,0);
+  assert.equal(res.status,200);assert.equal(body.fallback,true);assert.equal(body.policyExpiresAt,generatedAt+86400000);assert.equal(writes,1);
+  assert.equal(saved.headers.get('x-prospect-cached-at'),String(generatedAt));
+  assert.ok(Number(saved.headers.get('cache-control').split('=')[1])<=79200);
+  const next=await c.handleReservationAvailability_(request(),env,{}),nextBody=await next.json();
+  assert.equal(next.headers.get('x-prospect-cache'),'HIT');assert.equal(nextBody.policyExpiresAt,body.policyExpiresAt);assert.equal(reads,1);assert.equal(writes,1);
 });
 test('invalid upstream origin needs one bounded refresh, fallback cannot impersonate live',async()=>{
   for(const generatedAt of [undefined,0,'123',Infinity,NaN,Date.now()+60000,Date.now()-86400001]){

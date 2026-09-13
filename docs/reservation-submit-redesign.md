@@ -11,7 +11,7 @@ Now: LINE identity verification → local signed-policy validation → GAS durab
 ## Public policy
 
 - Dates and class state may be reused for less than 24 hours from the original GAS `generatedAt`. Cache insertion, fallback delivery and proof signing never renew that timestamp.
-- Cache hits require no upstream read. Cache misses/expiry use the existing 8-second total read budget. Invalid/unknown/future timestamps still fail closed if a bounded refresh fails. Verified fallback cannot renew the edge cache.
+- Cache hits require no upstream read. Cache misses/expiry use the existing 8-second total read budget. Invalid/unknown/future timestamps still fail closed if a bounded refresh fails. Verified fallback may populate the cache only for the remaining part of its original 24-hour lifetime; neither its timestamp nor expiry is renewed. This avoids repeated GAS reads when GAS serves a verified snapshot.
 - This is expiry-based refresh on demand, not a newly installed midnight cron job. Different edge locations may refresh at different times; policy age cannot exceed 24 hours. Administrative closures/waitlist changes may take up to 24 hours to affect an already displayed form.
 - The API signs only public route, original generation time, dates, class state and fixed class. HMAC-SHA-256 uses the existing server-only GAS_FORWARD_KEY with a dedicated domain prefix. No new secret/binding or personal data store is needed.
 - The form returns this proof on submit. The Worker verifies signature, route, age, class, reception type and date without contacting GAS for policy. LINE identity verification and input validation remain mandatory. Past dates are removed when delivering cached data and rejected at submission.

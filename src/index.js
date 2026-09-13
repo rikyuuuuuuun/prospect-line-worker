@@ -182,7 +182,7 @@ function reservationAvailabilityResponse_(payload, cachedAt) {
     headers: {
       'content-type': 'application/json; charset=utf-8',
       // Internal cache only; original generatedAt, not cache insertion, bounds validity.
-      'cache-control': 'public, max-age=86400',
+      'cache-control': 'public, max-age=' + Math.max(0, Math.floor((payload.generatedAt + RESERVATION_UPSTREAM_MAX_AGE_MS - Date.now()) / 1000)),
       'x-content-type-options': 'nosniff',
       'x-prospect-cached-at': String(cachedAt || Date.now()),
     },
@@ -336,11 +336,11 @@ async function handleReservationAvailability_(request, env, ctx) {
       }
     }
     const payload = await loadReservationAvailabilityPayload_(env, routeKey, false, startedAt + RESERVATION_READ_BUDGET_MS);
-    if (!payload.fallback) {
-      const write = storeAvailabilityCache_(cacheKey, reservationAvailabilityResponse_(payload, payload.generatedAt));
-      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(write);
-      else await write;
-    }
+    // Verified snapshots are also reusable under the daily policy. Cache TTL and
+    // proofs retain their original expiry, including when GAS returns fallback.
+    const write = storeAvailabilityCache_(cacheKey, reservationAvailabilityResponse_(payload, payload.generatedAt));
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(write);
+    else await write;
     return await deliverReservationAvailability_(payload, env, routeKey, payload.fallback ? 'FALLBACK' : 'MISS', startedAt);
   } catch (error) {
     return availabilityDeliveryResponse_(reservationError_(error), 'ERROR', startedAt);
