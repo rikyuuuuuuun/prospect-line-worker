@@ -6,14 +6,14 @@ import { Window } from 'happy-dom';
 
 const source = (await readFile(new URL('../src/index.js', import.meta.url), 'utf8')).replace('export default {', 'globalThis.worker = {');
 const route = 'b/tsuruse';
-const good = () => ({ ok: true, generatedAt: Date.now(), dates: [{value:'2026-09-20',label:'9月20日'}], classes: [{value:'前半',status:'open'},{value:'後半',status:'waitlist'}] });
+const good = () => ({ ok: true, availabilityProof:{payload:'fixture',signature:'fixture'}, policyExpiresAt:Date.now()+86400000, generatedAt: Date.now(), dates: [{value:'2026-09-20',label:'9月20日'}], classes: [{value:'前半',status:'open'},{value:'後半',status:'waitlist'}] });
 const deferred = () => { let resolve, reject; const promise = new Promise((yes,no) => {resolve=yes;reject=no}); return {promise,resolve,reject}; };
 const settle = () => new Promise(resolve => setImmediate(resolve));
 function workerContext(extra = {}) {
   const context = { console:{error(){},warn(){}}, Request, Response, Headers, URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, setTimeout, clearTimeout, Date, crypto:globalThis.crypto, ...extra };
   vm.createContext(context);vm.runInContext(source,context);return context;
 }
-function browser(t, {init = async()=>{}, fetch = async()=>Response.json(good()), url='https://fixture.invalid/reserve?route='+route, sdk=true, permission=async()=>({state:'granted'}), storage=new Map()} = {}) {
+function browser(t, {init = async()=>{}, fetch = async()=>Response.json(good()), url='https://fixture.invalid/reserve?route='+route, sdk=true, permission=async()=>({state:'granted'}), chat=async()=>{}, storage=new Map()} = {}) {
   const dom = new Window({url,settings:{disableJavaScriptEvaluation:true,disableJavaScriptFileLoading:true,disableCSSFileLoading:true}});
   t.after(()=>dom.happyDOM.abort());
   const html=workerContext().buildReservationHtml_('fixture-liff');
@@ -22,7 +22,7 @@ function browser(t, {init = async()=>{}, fetch = async()=>Response.json(good()),
   if(!sdk)dom.document.head.appendChild=node=>{sdkScripts.push(node);return node};
   const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
   let nextTimer=0;const timers=new Map();const marks=[];const calls=[];
-  const liff={init:(...args)=>{calls.push('init');return init(...args)},isInClient:()=>true,isLoggedIn:()=>true,getContext:()=>({type:'utou'}),getIDToken:()=>'fixture-token',permission:{query:(...args)=>{calls.push('permission');return permission(...args)}},sendMessages:async()=>{calls.push('chat')}};
+  const liff={init:(...args)=>{calls.push('init');return init(...args)},isInClient:()=>true,isLoggedIn:()=>true,getContext:()=>({type:'utou'}),getIDToken:()=>'fixture-token',permission:{query:(...args)=>{calls.push('permission');return permission(...args)}},sendMessages:async()=>{calls.push('chat');return chat()}};
   const c={document:dom.document, location:new URL(url), URL, URLSearchParams, AbortController, crypto:globalThis.crypto, console:{error(){},warn(){}}, performance:{mark:name=>marks.push(name)},
     sessionStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
     fetch:(...args)=>{calls.push(args[0]);return fetch(...args)},
@@ -152,23 +152,10 @@ test('expired drafts and denied session storage never block the form',async t=>{
   b.run('saveDraft();restoreDraft()');assert.equal(b.element('submitButton').disabled,false);
 });
 
-test('a hung receipt permission query is absent from startup and blocks reservation writes on submit',async t=>{
-  const b=browser(t,{permission:()=>new Promise(()=>{})});await settle();
-  assert.equal(b.element('submitButton').disabled,false);assert.equal(b.calls.includes('permission'),false);
-  b.dom.document.querySelector('.child-name').value='検証用';b.dom.document.querySelector('.child-grade').value='1年生';
-  b.element('className').value='後半';b.event('className','change');
-  b.event('reservationForm','submit');b.event('reservationForm','submit');await settle();
-  assert.equal(b.calls.filter(x=>x==='permission').length,1);
-  assert.equal(b.calls.includes('/api/reservations'),false);
-  b.fire(12000);await settle();
-  assert.equal(b.calls.includes('/api/reservations'),false);
-  assert.match(b.element('status').textContent,/まだ送信されていません/);
-});
-
 test('cache failure does not discard good availability; POST never receives the internal 24h TTL',async()=>{
   const c=workerContext({caches:{default:{match:async()=>{throw Error('cache failure')},put:async()=>{throw Error('cache full')}}}});
   c.forwardAvailabilityToGas_=async()=>good();
-  const response=await c.handleReservationAvailability_(new Request('https://fixture.invalid/api/reservations/availability',{method:'POST',body:JSON.stringify({route})}),{},{});
+  const response=await c.handleReservationAvailability_(new Request('https://fixture.invalid/api/reservations/availability',{method:'POST',body:JSON.stringify({route})}),{GAS_FORWARD_KEY:'fixture-signing-key'},{});
   assert.equal(response.status,200);assert.equal(response.headers.get('cache-control'),'no-store');assert.equal(response.headers.get('x-prospect-cache'),'MISS');
   assert.match(response.headers.get('server-timing'),/^availability;dur=\d+$/);
 });
@@ -176,7 +163,7 @@ test('cache failure does not discard good availability; POST never receives the 
 test('a fresh edge hit does not reach GAS or LINE',async()=>{
   const c=workerContext();c.caches={default:{match:async()=>c.reservationAvailabilityResponse_(good(),Date.now())}};
   c.forwardAvailabilityToGas_=async()=>{throw Error('must not fetch')};
-  const response=await c.handleReservationAvailability_(new Request('https://fixture.invalid/api/reservations/availability',{method:'POST',body:JSON.stringify({route})}),{},{});
+  const response=await c.handleReservationAvailability_(new Request('https://fixture.invalid/api/reservations/availability',{method:'POST',body:JSON.stringify({route})}),{GAS_FORWARD_KEY:'fixture-signing-key'},{});
   assert.equal(response.status,200);assert.equal(response.headers.get('cache-control'),'no-store');assert.equal(response.headers.get('x-prospect-cache'),'HIT');
 });
 
@@ -195,4 +182,66 @@ test('age-verification refresh shares the initial request deadline',async()=>{
   const deadline=Date.now()+8000;
   await c.loadReservationAvailabilityPayload_({},route,false,deadline);
   assert.deepEqual(deadlines,[deadline,deadline]);assert.deepEqual(requestBodies,['reservation_availability','reservation_availability_refresh']);
+});
+
+function fillWaitlist(b){
+  b.dom.document.querySelector('.child-name').value='検証用';b.dom.document.querySelector('.child-grade').value='1年生';
+  b.element('className').value='後半';b.event('className','change');
+}
+test('slow receipt permission never delays durable acceptance or permits duplicate reservations',async t=>{
+  const permission=deferred(),save=deferred();
+  const b=browser(t,{permission:()=>permission.promise,fetch:async path=>path==='/api/reservations'?save.promise:Response.json(good())});await settle();fillWaitlist(b);
+  b.event('reservationForm','submit');b.event('reservationForm','submit');await settle();
+  assert.equal(b.calls.filter(x=>x==='/api/reservations').length,1);
+  assert.equal(b.calls.includes('permission'),false);
+  assert.equal(b.element('success').classList.contains('hidden'),true);
+  save.resolve(Response.json({ok:true,receiptId:'fixture'}));await settle();
+  assert.equal(b.element('success').classList.contains('hidden'),false);
+  assert.equal(b.element('closeButton').classList.contains('hidden'),false);
+  assert.equal(b.calls.filter(x=>x==='permission').length,1);
+  assert.equal(b.calls.includes('chat'),false);
+  b.fire(4000);assert.match(b.element('chatStatus').textContent,/受付済み/);
+  b.event('reservationForm','submit');await settle();assert.equal(b.calls.filter(x=>x==='/api/reservations').length,1);
+  permission.resolve({state:'granted'});await settle();assert.equal(b.calls.filter(x=>x==='chat').length,1);
+});
+test('pending chat receipt cannot be duplicated after watchdog; late success recovers',async t=>{
+  const chat=deferred();const b=browser(t,{chat:()=>chat.promise});await settle();fillWaitlist(b);
+  b.event('reservationForm','submit');await settle();
+  assert.equal(b.element('success').classList.contains('hidden'),false);
+  b.fire(4000);b.event('retryChatButton','click');b.event('retryChatButton','click');await settle();
+  assert.equal(b.calls.filter(x=>x==='chat').length,1);
+  chat.resolve();await settle();assert.ok(b.marks.includes('reservation:receipt-sent'));
+  assert.equal(b.element('retryChatButton').classList.contains('hidden'),true);
+});
+test('receipt failure retries only the receipt and never repeats the saved reservation',async t=>{
+  let sends=0;const b=browser(t,{chat:async()=>{if(++sends===1)throw Error('network')}});await settle();fillWaitlist(b);
+  b.event('reservationForm','submit');await settle();assert.match(b.element('chatStatus').textContent,/受付済み/);
+  b.event('retryChatButton','click');b.event('retryChatButton','click');await settle();
+  assert.equal(sends,2);assert.equal(b.calls.filter(x=>x==='/api/reservations').length,1);
+});
+test('save failure never displays acceptance or sends chat; retry preserves the request id',async t=>{
+  const payloads=[];const b=browser(t,{fetch:async(path,opts)=>{
+    if(path==='/api/reservations'){payloads.push(JSON.parse(opts.body));return Response.json({ok:false,message:'gas_timeout'},{status:502})}
+    return Response.json(good());
+  }});await settle();fillWaitlist(b);b.event('reservationForm','submit');await settle();
+  assert.equal(b.element('success').classList.contains('hidden'),true);assert.equal(b.calls.includes('chat'),false);
+  b.event('reservationForm','submit');await settle();
+  assert.equal(payloads.length,2);assert.equal(payloads[0].requestId,payloads[1].requestId);
+  assert.deepEqual(payloads[0].availabilityProof,good().availabilityProof);
+});
+test('expired policy refreshes in place, preserves child input and requires review before any save',async t=>{
+  const b=browser(t);await settle();fillWaitlist(b);b.run('policyExpiresAt=Date.now()-1');
+  b.event('reservationForm','submit');await settle();
+  assert.equal(b.calls.includes('/api/reservations'),false);
+  assert.equal(b.calls.filter(x=>x==='/api/reservations/availability').length,2);
+  assert.equal(b.dom.document.querySelector('.child-name').value,'検証用');
+  assert.equal(b.element('className').value,'後半');assert.match(b.element('status').textContent,/もう一度送信/);
+});
+test('server policy rejection refreshes the form without auto-submitting',async t=>{
+  const b=browser(t,{fetch:async path=>path==='/api/reservations'?Response.json({ok:false,message:'availability_policy_expired'},{status:409}):Response.json(good())});
+  await settle();fillWaitlist(b);b.event('reservationForm','submit');await settle();
+  assert.equal(b.calls.filter(x=>x==='/api/reservations').length,1);
+  assert.equal(b.calls.filter(x=>x==='/api/reservations/availability').length,2);
+  assert.equal(b.dom.document.querySelector('.child-name').value,'検証用');
+  assert.equal(b.element('success').classList.contains('hidden'),true);
 });
