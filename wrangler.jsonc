@@ -2,5 +2,12 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "prospect-line-webhook",
   "main": "src/index.js",
-  "compatibility_date": "2026-08-12"
+  "compatibility_date": "2026-08-12",
+  "exports": {
+    "ReservationOutbox": { "type": "durable-object", "storage": "sqlite" }
+  },
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": false }
+  }
 }

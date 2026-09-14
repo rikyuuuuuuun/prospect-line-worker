@@ -19,6 +19,8 @@
  * CloudflareのACTIVITY_LIFF_ID変数は参照しないため、残っていても動作へ影響しません。
  */
 
+export { ReservationOutbox } from './reservation-outbox.js';
+
 const ROUTES = Object.freeze({
   'a/saitama-shibakawa': route_('LINE_SECRET_A_SAITAMA_SHIBAKAWA', 'A', '01_さいたま芝川', 'さいたま市立芝川小学校体育館'),
   'a/sugishita': route_('LINE_SECRET_A_SUGISHITA', 'A', '02_杉下', '杉下小学校体育館'),
@@ -59,8 +61,8 @@ const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 // 活動申込は全会場共通URLで使います。GAS転送時だけ既存の有効ルートを内部利用します。
 const ACTIVITY_GAS_ROUTE = 'a/saitama-shibakawa';
 const ACTIVITY_LIFF_ID = '2011040394-O4z7w36C';
-const WORKER_BUILD = '2026-09-13-reservation-fast-submit';
-const WORKER_RELEASE = '2026-09-13-reservation-fast-submit';
+const WORKER_BUILD = '2026-09-14-reservation-outbox-foundation';
+const WORKER_RELEASE = '2026-09-14-reservation-outbox-foundation';
 const RESERVATION_READ_BUDGET_MS = 8000;
 const EXPECTED_GAS_BUILD = '2026-08-13-single-slot-auto1';
 // Owner-approved policy: public dates/class states may lag by up to 24 hours.
@@ -96,6 +98,14 @@ export default {
 
     if (request.method === 'GET' && path === 'health/gas') {
       return handleGasHealth_(env);
+    }
+
+    if (['GET', 'POST'].includes(request.method) && path === 'health/reservation-storage') {
+      try {
+        const probe = ctx.exports.ReservationOutbox.getByName('diagnostic-v1', { locationHint: 'apac' });
+        const result = request.method === 'POST' ? await probe.startProbe() : await probe.probeStatus();
+        return json_(result, 200);
+      } catch (_) { return json_({ ok: false, message: 'reservation_storage_unavailable' }, 503); }
     }
 
     if (request.method === 'GET' && (path === 'reserve' || path.startsWith('reserve/'))) {
