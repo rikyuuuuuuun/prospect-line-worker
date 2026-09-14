@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
-const source=(await readFile(new URL('../src/index.js',import.meta.url),'utf8')).replace('export default {','globalThis.worker = {');
+const source=(await readFile(new URL('../src/index.js',import.meta.url),'utf8')).replace(/^export \{ ReservationOutbox \} from .*;$/m, '').replace('export default {','globalThis.worker = {');
 function setup(extra={}){
   const c={console:{error(){},warn(){}},Request,Response,URL,URLSearchParams,Headers,TextEncoder,TextDecoder,setTimeout,clearTimeout,AbortController,Date,crypto:globalThis.crypto,...extra};
   vm.createContext(c);vm.runInContext(source,c);return c;
