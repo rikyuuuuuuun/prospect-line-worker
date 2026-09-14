@@ -53,3 +53,32 @@ it.each(['identity','policy','expired','closed'])('invalid %s fails before creat
   expect((await post('/api/reservations',data)).status).toBeGreaterThanOrEqual(400);
   expect(await object(data).status()).toBeNull();expect(network).not.toHaveBeenCalled();
 });
+
+async function webhook(events, valid=true) {
+  const body=JSON.stringify({destination:'synthetic',events});
+  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.LINE_SECRET_B_TSURUSE),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  const bytes=new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(body)));
+  const signature=btoa(String.fromCharCode(...bytes));
+  return exports.default.fetch('https://fixture.invalid/line/'+route,{method:'POST',body,headers:{'x-line-signature':valid?signature:'invalid'}});
+}
+
+it('a verified early LINE receipt is acknowledged without racing a second GAS intake',async()=>{
+  const data=await booking();await post('/api/reservations',data);
+  const receipt={type:'message',source:{userId},message:{type:'text',text:'【体験予約を送信しました】\nsynthetic\n受付番号：FORM-'+data.requestId}};
+  expect((await webhook([receipt])).status).toBe(200);
+  expect(network).not.toHaveBeenCalled();
+  expect((await webhook([receipt],false)).status).toBe(401);
+  expect(network).not.toHaveBeenCalled();
+});
+
+it('ordinary chat in a batch still reaches GAS; an unknown or different sender receipt is not discarded',async()=>{
+  const data=await booking();await post('/api/reservations',data);
+  const receipt={type:'message',source:{userId},message:{type:'text',text:'【体験予約を送信しました】\nsynthetic\n受付番号：FORM-'+data.requestId}};
+  const chat={type:'message',source:{userId},message:{type:'text',text:'ordinary synthetic chat'}};
+  network.mockImplementation(async()=>Response.json({ok:true}));
+  expect((await webhook([receipt,chat])).status).toBe(200);
+  expect(JSON.parse(network.mock.calls[0][1].body).events).toEqual([chat]);
+  const another={...receipt,source:{userId:'U'+'2'.repeat(32)}};
+  expect((await webhook([another])).status).toBe(200);
+  expect(JSON.parse(network.mock.calls[1][1].body).events).toEqual([another]);
+});
