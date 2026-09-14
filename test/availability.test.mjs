@@ -75,16 +75,17 @@ test('signed policy checks closed, waitlist, open and selected date locally',asy
 });
 test('tampered, cross-venue, wrong-key and malformed policy cannot authorize writes',async()=>{
   const c=setup(),proof=await c.signReservationPolicy_(env,route,good());let writes=0;
-  c.verifyLineIdToken_=async()=>({sub:'U'+'0'.repeat(32)});c.forwardToGas_=async()=>{writes++;return {ok:true}};
+  c.verifyLineIdToken_=async()=>({sub:'U'+'0'.repeat(32)});c.storeReservation_=async()=>{writes++;return {ok:true}};
   for(const availabilityProof of [null,{}, {...proof,signature:'00'.repeat(32)},{...proof,payload:proof.payload.replace('waitlist','open')},await c.signReservationPolicy_(env,'d/shima',good()),await c.signReservationPolicy_({GAS_FORWARD_KEY:'other'},route,good())]){
     const res=await submit(c,reservation({availabilityProof}));assert.equal(res.status,400);assert.equal((await res.json()).message,'invalid_availability_policy');
   }
   assert.equal(writes,0);
 });
-test('signed snapshot submits after cache eviction, with exactly one GAS storage call',async()=>{
+test('signed snapshot submits after cache eviction, with exactly one durable storage call and no GAS read',async()=>{
   const c=setup(),writes=[];let reads=0;c.verifyLineIdToken_=async()=>({sub:'U'+'0'.repeat(32),name:'fixture'});
   c.forwardAvailabilityToGas_=async()=>{reads++;throw Error('must not reread')};
-  c.forwardToGas_=async(_env,_route,raw)=>{writes.push(JSON.parse(raw));return {ok:true,receiptId:'fixture',duplicate:true}};
+  c.forwardToGas_=()=>{throw Error('GAS must not block acceptance')};
+  c.storeReservation_=async(_env,_ctx,_route,payload)=>{writes.push(payload);return {ok:true,receiptId:'fixture',duplicate:true}};
   const availabilityProof=await c.signReservationPolicy_(env,route,good({generatedAt:Date.now()-23*3600000}));
   const res=await submit(c,reservation({availabilityProof}));assert.equal(res.status,200);assert.equal((await res.json()).duplicate,true);
   assert.equal(reads,0);assert.equal(writes.length,1);assert.equal(writes[0].source,'reservation_form');assert.equal(writes[0].requestId,'fixture-1234567890');assert.equal(writes[0].availabilityProof,undefined);
@@ -92,23 +93,23 @@ test('signed snapshot submits after cache eviction, with exactly one GAS storage
 });
 test('identity failure never stores despite a valid policy',async()=>{
   const c=setup(),availabilityProof=await c.signReservationPolicy_(env,route,good());
-  c.verifyLineIdToken_=async()=>{throw Error('invalid_line_identity')};c.forwardToGas_=()=>{throw Error('must not write')};
+  c.verifyLineIdToken_=async()=>{throw Error('invalid_line_identity')};c.storeReservation_=()=>{throw Error('must not write')};
   assert.equal((await submit(c,reservation({availabilityProof}))).status,401);
 });
 test('expiry during entry rejects before storage and cannot be renewed by signing',async()=>{
   const c=setup(),availabilityProof=await c.signReservationPolicy_(env,route,good());
-  c.verifyLineIdToken_=async()=>({sub:'U'+'0'.repeat(32)});c.forwardToGas_=()=>{throw Error('must not write')};c.Date={now:()=>Date.now()+86400001};
+  c.verifyLineIdToken_=async()=>({sub:'U'+'0'.repeat(32)});c.storeReservation_=()=>{throw Error('must not write')};c.Date={now:()=>Date.now()+86400001};
   assert.equal((await submit(c,reservation({availabilityProof}))).status,409);
   await assert.rejects(()=>c.signReservationPolicy_(env,route,good()),/expired/);
 });
 test('legacy HTML uses cached public policy, not forced live rereads',async()=>{
   const c=setup();let writes=0;c.verifyLineIdToken_=async()=>({sub:'U'+'0'.repeat(32)});
-  c.caches={default:{match:async()=>c.reservationAvailabilityResponse_(good())}};c.forwardAvailabilityToGas_=()=>{throw Error('must not read')};c.forwardToGas_=async()=>{writes++;return {ok:true}};
+  c.caches={default:{match:async()=>c.reservationAvailabilityResponse_(good())}};c.forwardAvailabilityToGas_=()=>{throw Error('must not read')};c.storeReservation_=async()=>{writes++;return {ok:true}};
   assert.equal((await submit(c,reservation())).status,200);assert.equal(writes,1);
 });
-test('GAS failure, empty or ambiguous result never reports accepted',async()=>{
+test('durable storage failure, empty or ambiguous result never reports accepted',async()=>{
   for(const result of [null,{}, {ok:false,message:'reservation_busy'}]){
-    const c=setup();c.verifyLineIdToken_=async()=>({sub:'U'+'0'.repeat(32)});c.forwardToGas_=async()=>result;
+    const c=setup();c.verifyLineIdToken_=async()=>({sub:'U'+'0'.repeat(32)});c.storeReservation_=async()=>result;
     const availabilityProof=await c.signReservationPolicy_(env,route,good()),res=await submit(c,reservation({availabilityProof}));
     assert.equal(res.status,502);assert.equal((await res.json()).ok,false);
   }
@@ -124,7 +125,7 @@ test('cached dates from yesterday are removed and past-date submissions never st
   const c=setup();c.caches={default:{match:async()=>c.reservationAvailabilityResponse_(good({dates:[{value:'2000-01-01',label:'past'},...good().dates]}))}};
   const res=await c.handleReservationAvailability_(request(),env,{}),body=await res.json();
   assert.ok(body.dates.every(item=>item.value!=='2000-01-01'));
-  c.forwardToGas_=()=>{throw Error('must not write')};c.verifyLineIdToken_=()=>{throw Error('must not verify invalid input')};
+  c.storeReservation_=()=>{throw Error('must not write')};c.verifyLineIdToken_=()=>{throw Error('must not verify invalid input')};
   assert.equal((await submit(c,reservation({availabilityProof:body.availabilityProof,className:'前半',receptionType:'reservation',experienceDate:'2000-01-01'}))).status,400);
 });
 

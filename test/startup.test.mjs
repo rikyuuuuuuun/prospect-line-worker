@@ -13,7 +13,7 @@ function workerContext(extra = {}) {
   const context = { console:{error(){},warn(){}}, Request, Response, Headers, URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, setTimeout, clearTimeout, Date, crypto:globalThis.crypto, ...extra };
   vm.createContext(context);vm.runInContext(source,context);return context;
 }
-function browser(t, {init = async()=>{}, fetch = async()=>Response.json(good()), url='https://fixture.invalid/reserve?route='+route, sdk=true, permission=async()=>({state:'granted'}), chat=async()=>{}, storage=new Map()} = {}) {
+function browser(t, {init = async()=>{}, fetch = async()=>Response.json(good()), session=async()=>Response.json({ok:true,identityProof:{payload:'session',signature:'test'},expiresAt:Date.now()+900000}), url='https://fixture.invalid/reserve?route='+route, sdk=true, permission=async()=>({state:'granted'}), chat=async()=>{}, storage=new Map()} = {}) {
   const dom = new Window({url,settings:{disableJavaScriptEvaluation:true,disableJavaScriptFileLoading:true,disableCSSFileLoading:true}});
   t.after(()=>dom.happyDOM.abort());
   const html=workerContext().buildReservationHtml_('fixture-liff');
@@ -25,7 +25,7 @@ function browser(t, {init = async()=>{}, fetch = async()=>Response.json(good()),
   const liff={init:(...args)=>{calls.push('init');return init(...args)},isInClient:()=>true,isLoggedIn:()=>true,getContext:()=>({type:'utou'}),getIDToken:()=>'fixture-token',permission:{query:(...args)=>{calls.push('permission');return permission(...args)}},sendMessages:async()=>{calls.push('chat');return chat()}};
   const c={document:dom.document, location:new URL(url), URL, URLSearchParams, AbortController, crypto:globalThis.crypto, console:{error(){},warn(){}}, performance:{mark:name=>marks.push(name)},
     sessionStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
-    fetch:(...args)=>{calls.push(args[0]);return fetch(...args)},
+    fetch:(...args)=>{calls.push(args[0]);return args[0]==='/api/reservations/session'?session(...args):fetch(...args)},
     setTimeout:(fn,ms)=>{const id=++nextTimer;timers.set(id,{fn,ms});return id},clearTimeout:id=>timers.delete(id),
     addEventListener:dom.addEventListener.bind(dom), ...(sdk?{liff}:{})};
   c.window=c;vm.createContext(c);vm.runInContext(script,c);
@@ -225,8 +225,10 @@ test('save failure never displays acceptance or sends chat; retry preserves the 
     return Response.json(good());
   }});await settle();fillWaitlist(b);b.event('reservationForm','submit');await settle();
   assert.equal(b.element('success').classList.contains('hidden'),true);assert.equal(b.calls.includes('chat'),false);
-  b.event('reservationForm','submit');await settle();
+  b.fire(600);await settle();
   assert.equal(payloads.length,2);assert.equal(payloads[0].requestId,payloads[1].requestId);
+  assert.equal(b.element('submitButton').disabled,false);
+  assert.equal(b.calls.includes('chat'),false);
   assert.deepEqual(payloads[0].availabilityProof,good().availabilityProof);
 });
 test('expired policy refreshes in place, preserves child input and requires review before any save',async t=>{
@@ -244,4 +246,40 @@ test('server policy rejection refreshes the form without auto-submitting',async 
   assert.equal(b.calls.filter(x=>x==='/api/reservations/availability').length,2);
   assert.equal(b.dom.document.querySelector('.child-name').value,'検証用');
   assert.equal(b.element('success').classList.contains('hidden'),true);
+});
+
+test('LINE identity is prepared during entry; clicking submit reuses it and shows a closable receipt',async t=>{
+  let payload;
+  const b=browser(t,{fetch:async(path,options)=>{
+    if(path==='/api/reservations'){payload=JSON.parse(options.body);return Response.json({ok:true,receiptId:'FORM-test',receptionType:'waitlist'})}
+    return Response.json(good());
+  }});await settle();
+  assert.equal(b.calls.filter(x=>x==='/api/reservations/session').length,1);
+  assert.equal(b.calls.includes('/api/reservations'),false);
+  assert.ok(b.marks.includes('reservation:identity-ready'));
+  fillWaitlist(b);b.event('reservationForm','submit');await settle();
+  assert.equal(b.calls.filter(x=>x==='/api/reservations/session').length,1);
+  assert.equal(payload.idToken,undefined);assert.ok(payload.identityProof);
+  assert.equal(b.element('receiptNumber').textContent,'受付番号：FORM-test');
+  assert.match(b.element('success').textContent,/閉じて大丈夫/);
+  assert.equal(b.element('closeButton').classList.contains('hidden'),false);
+});
+
+test('clicking during identity preparation shares the request and cannot create an unauthenticated booking',async t=>{
+  const auth=deferred();const b=browser(t,{session:()=>auth.promise});await settle();
+  fillWaitlist(b);b.event('reservationForm','submit');b.event('reservationForm','submit');await settle();
+  assert.equal(b.calls.filter(x=>x==='/api/reservations/session').length,1);
+  assert.equal(b.calls.includes('/api/reservations'),false);
+  auth.resolve(Response.json({ok:true,identityProof:{payload:'session',signature:'test'},expiresAt:Date.now()+900000}));await settle();
+  assert.equal(b.calls.filter(x=>x==='/api/reservations').length,1);
+});
+
+test('failed identity preparation never saves, preserves input, and recovers on retry',async t=>{
+  let attempts=0;
+  const b=browser(t,{session:async()=>++attempts<3?Response.json({ok:false,message:'line_identity_temporarily_unavailable'},{status:502}):Response.json({ok:true,identityProof:{payload:'session',signature:'test'},expiresAt:Date.now()+900000})});
+  await settle();fillWaitlist(b);b.event('reservationForm','submit');await settle();
+  assert.equal(b.calls.includes('/api/reservations'),false);
+  assert.equal(b.dom.document.querySelector('.child-name').value,'検証用');
+  b.event('reservationForm','submit');await settle();
+  assert.equal(b.calls.filter(x=>x==='/api/reservations').length,1);
 });
