@@ -27,6 +27,7 @@ it('deduplicates simultaneous submissions and rejects changed content under the 
   const results = await Promise.all([object.accept('test-route', data), object.accept('test-route', data)]);
   expect(results[0].receiptId).toBe(results[1].receiptId);
   expect(results.filter(x => x.duplicate)).toHaveLength(1);
+  expect((await object.accept('test-route', { ...data, lineDisplayName: 'renamed' })).duplicate).toBe(true);
   await expect(Promise.resolve(object.accept('test-route', { ...data, notes: 'changed' }))).rejects.toThrow('reservation_request_conflict');
 });
 

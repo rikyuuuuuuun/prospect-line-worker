@@ -5,7 +5,7 @@
  * 役割:
  * 1. LINE Webhookの署名を会場ごとに検証し、共通GASへ転送
  * 2. /reserve でLINE内体験予約フォームを表示
- * 3. LINEのIDトークンをサーバー側で検証してから、予約を共通GASへ保存
+ * 3. LINE本人確認後に予約を永続保存し、共通GASへ自動反映
  * 4. /apply でイベント・大会申込をLINE内で完了し、申込控えをLINEトークへ残す
  *
  * 必須Bindings:
@@ -61,8 +61,8 @@ const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 // 活動申込は全会場共通URLで使います。GAS転送時だけ既存の有効ルートを内部利用します。
 const ACTIVITY_GAS_ROUTE = 'a/saitama-shibakawa';
 const ACTIVITY_LIFF_ID = '2011040394-O4z7w36C';
-const WORKER_BUILD = '2026-09-14-reservation-outbox-foundation';
-const WORKER_RELEASE = '2026-09-14-reservation-outbox-foundation';
+const WORKER_BUILD = '2026-09-14-reservation-durable-accept';
+const WORKER_RELEASE = '2026-09-14-reservation-durable-accept';
 const RESERVATION_READ_BUDGET_MS = 8000;
 const EXPECTED_GAS_BUILD = '2026-08-13-single-slot-auto1';
 // Owner-approved policy: public dates/class states may lag by up to 24 hours.
@@ -122,7 +122,11 @@ export default {
     }
 
     if (request.method === 'POST' && path === 'api/reservations') {
-      return handleReservationSubmit_(request, env);
+      return handleReservationSubmit_(request, env, ctx);
+    }
+
+    if (request.method === 'POST' && path === 'api/reservations/session') {
+      return handleReservationSession_(request, env);
     }
 
     if (request.method === 'POST' && path === 'api/activities/form') {
@@ -134,7 +138,7 @@ export default {
     }
 
     if (request.method === 'POST' && path.startsWith('line/')) {
-      return handleLineWebhook_(request, env, path.slice('line/'.length));
+      return handleLineWebhook_(request, env, path.slice('line/'.length), ctx);
     }
 
     return json_({ ok: false, message: 'not_found' }, 404);
@@ -151,7 +155,7 @@ function route_(secretBinding, team, venue, publicVenue, fixedClass) {
   });
 }
 
-async function handleLineWebhook_(request, env, rawRoute) {
+async function handleLineWebhook_(request, env, rawRoute, ctx) {
   const routeKey = normalizeRoute_(rawRoute);
   const route = ROUTES[routeKey];
   if (!route) return json_({ ok: false, message: 'unknown_route' }, 404);
@@ -169,7 +173,20 @@ async function handleLineWebhook_(request, env, rawRoute) {
   if (!valid) return json_({ ok: false, message: 'invalid_signature' }, 401);
 
   try {
-    const result = await forwardToGas_(env, routeKey, body);
+    // The new receipt may arrive before the outbox has synced to GAS. Suppress
+    // only receipts whose sender/route/request ID already has durable acceptance.
+    // All ordinary chat and legacy events keep the existing forwarding path.
+    const envelope = JSON.parse(body);
+    let forwardBody = body;
+    if (Array.isArray(envelope.events)) {
+      const events = [];
+      for (const event of envelope.events) {
+        if (!await isAcceptedReservationReceipt_(ctx, routeKey, event)) events.push(event);
+      }
+      if (!events.length && envelope.events.length) return json_({ ok: true }, 200);
+      if (events.length !== envelope.events.length) forwardBody = JSON.stringify({ ...envelope, events });
+    }
+    const result = await forwardToGas_(env, routeKey, forwardBody);
     if (result && result.ok === false) {
       return json_({ ok: false, message: 'gas_rejected' }, 502);
     }
@@ -177,6 +194,17 @@ async function handleLineWebhook_(request, env, rawRoute) {
   } catch (error) {
     return json_({ ok: false, message: 'gas_unreachable' }, 502);
   }
+}
+
+async function isAcceptedReservationReceipt_(ctx, routeKey, event) {
+  if (event?.type !== 'message' || event.message?.type !== 'text' ||
+      !/^U[0-9a-f]{32}$/i.test(String(event.source?.userId || ''))) return false;
+  const text = String(event.message.text || '');
+  if (!text.startsWith('【体験予約を送信しました】\n') && !text.startsWith('【体験キャンセル待ちを申し込みました】\n')) return false;
+  const match = text.match(/\n受付番号：FORM-([A-Za-z0-9-]{16,80})$/);
+  if (!match) return false;
+  const status = await reservationOutbox_(ctx, routeKey, event.source.userId, match[1]).status();
+  return Boolean(status?.receiptId === 'FORM-' + match[1] && ['pending', 'synced'].includes(status.state));
 }
 
 function reservationAvailabilityCacheKey_(request, routeKey) {
@@ -416,7 +444,52 @@ function mapGasRejection_(message) {
   return 'gas_activity_calendar_error';
 }
 
-async function handleReservationSubmit_(request, env) {
+async function handleReservationSession_(request, env) {
+  try {
+    const body = await readJsonBody_(request);
+    const routeKey = requireRoute_(body.route);
+    // Do this while the person fills the form, with one bounded upstream call.
+    const identity = await verifyLineIdToken_(body.idToken, env, { attempts: 1, timeoutMs: 6000 });
+    const expiresAt = Math.min(Number(identity.exp) * 1000, Date.now() + 15 * 60000);
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error('invalid_line_identity');
+    const payload = JSON.stringify({ route: routeKey, aud: String(env.LINE_LOGIN_CHANNEL_ID),
+      sub: identity.sub, name: safeSingleLine_(identity.name, 80), expiresAt });
+    const signature = await crypto.subtle.sign('HMAC', await reservationPolicyKey_(env),
+      new TextEncoder().encode('prospect-reservation-session-v1\n' + payload));
+    return json_({ ok: true, identityProof: { payload,
+      signature: Array.from(new Uint8Array(signature), b => b.toString(16).padStart(2, '0')).join('') }, expiresAt }, 200);
+  } catch (error) { return reservationError_(error); }
+}
+
+async function readReservationIdentity_(env, routeKey, body) {
+  // Old HTML remains compatible, but new HTML pre-verifies before the click.
+  if (body.identityProof === undefined) return verifyLineIdToken_(body.idToken, env, { attempts: 1, timeoutMs: 6000 });
+  const proof = body.identityProof;
+  if (!proof || typeof proof.payload !== 'string' || proof.payload.length > 2000 ||
+      typeof proof.signature !== 'string' || !/^[0-9a-f]{64}$/.test(proof.signature)) throw new Error('invalid_line_identity');
+  const signature = Uint8Array.from(proof.signature.match(/../g), byte => parseInt(byte, 16));
+  if (!await crypto.subtle.verify('HMAC', await reservationPolicyKey_(env), signature,
+    new TextEncoder().encode('prospect-reservation-session-v1\n' + proof.payload))) throw new Error('invalid_line_identity');
+  let identity;
+  try { identity = JSON.parse(proof.payload); } catch (_) { throw new Error('invalid_line_identity'); }
+  if (!identity || identity.route !== routeKey || identity.aud !== String(env.LINE_LOGIN_CHANNEL_ID) ||
+      !/^U[0-9a-f]{32}$/i.test(String(identity.sub || '')) || !Number.isFinite(identity.expiresAt)) throw new Error('invalid_line_identity');
+  if (identity.expiresAt <= Date.now()) throw new Error('reservation_session_expired');
+  return identity;
+}
+
+function reservationOutbox_(ctx, routeKey, userId, requestId) {
+  if (!ctx?.exports?.ReservationOutbox) throw new Error('reservation_storage_unavailable');
+  return ctx.exports.ReservationOutbox.getByName(JSON.stringify([routeKey, userId, requestId]), { locationHint: 'apac' });
+}
+
+async function storeReservation_(env, ctx, routeKey, payload) {
+  const result = await reservationOutbox_(ctx, routeKey, payload.lineUserId, payload.requestId).accept(routeKey, payload);
+  if (!result || result.ok !== true || !result.receiptId) throw new Error('reservation_storage_unavailable');
+  return result;
+}
+
+async function handleReservationSubmit_(request, env, ctx) {
   const startedAt = Date.now();
   let identityMs = 0, policyMs = 0, storageMs = 0;
   function timed(response) {
@@ -428,7 +501,7 @@ async function handleReservationSubmit_(request, env) {
     const routeKey = requireRoute_(body.route);
     const reservation = validateReservation_(body, routeKey);
     let phaseAt = Date.now();
-    const identity = await verifyLineIdToken_(body.idToken, env);
+    const identity = await readReservationIdentity_(env, routeKey, body);
     identityMs = Date.now() - phaseAt;
     phaseAt = Date.now();
     let proof = body.availabilityProof;
@@ -445,7 +518,7 @@ async function handleReservationSubmit_(request, env) {
     await verifyReservationAvailabilityBeforeSubmit_(env, routeKey, reservation, proof);
     policyMs = Date.now() - phaseAt;
     phaseAt = Date.now();
-    const result = await forwardToGas_(env, routeKey, JSON.stringify({
+    const result = await storeReservation_(env, ctx, routeKey, {
       source: 'reservation_form',
       requestId: reservation.requestId,
       lineUserId: identity.sub,
@@ -456,7 +529,7 @@ async function handleReservationSubmit_(request, env) {
       children: reservation.children,
       referrer: reservation.referrer,
       notes: reservation.notes,
-    }), 2);
+    });
     storageMs = Date.now() - phaseAt;
     if (!result || result.ok !== true) throw new Error(result ? mapGasReservationError_(result.message) : 'gas_empty_response');
     return timed(json_({
@@ -853,22 +926,24 @@ function jstDateString_() {
   return map.year + '-' + map.month + '-' + map.day;
 }
 
-async function verifyLineIdToken_(idToken, env) {
+async function verifyLineIdToken_(idToken, env, options) {
   const token = String(idToken || '').trim();
   const clientId = String(env.LINE_LOGIN_CHANNEL_ID || '').trim();
   if (!token || !clientId) throw new Error('line_login_not_configured');
+  const attempts = options?.attempts || 3;
+  const timeoutMs = options?.timeoutMs || 12000;
   let response = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     response = await fetchWithTimeout_(LINE_ID_TOKEN_VERIFY_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ id_token: token, client_id: clientId }),
-    }, 12000).catch(function () { return null; });
+    }, timeoutMs, true).catch(function () { return null; });
     if (response && (response.ok || !isRetryableHttpStatus_(response.status))) break;
-    if (attempt < 2) await delay_(300 * (attempt + 1));
+    if (attempt < attempts - 1) await delay_(300 * (attempt + 1));
   }
   if (!response) throw new Error('line_identity_temporarily_unavailable');
-  if (!response.ok) throw new Error('invalid_line_identity');
+  if (!response.ok) throw new Error(isRetryableHttpStatus_(response.status) ? 'line_identity_temporarily_unavailable' : 'invalid_line_identity');
   const identity = await response.json();
   if (String(identity.aud || '') !== clientId || !/^U[0-9a-f]{32}$/i.test(String(identity.sub || ''))) {
     throw new Error('invalid_line_identity');
@@ -1140,8 +1215,8 @@ function reservationError_(error) {
     'invalid_class', 'invalid_reception_type', 'invalid_experience_date', 'selected_date_unavailable',
     'request_too_large', 'invalid_request', 'invalid_json', 'invalid_availability_policy',
   ];
-  const unauthorizedCodes = ['invalid_line_identity', 'line_login_not_configured'];
-  const conflictCodes = ['class_status_changed', 'class_closed', 'availability_policy_expired'];
+  const unauthorizedCodes = ['invalid_line_identity', 'line_login_not_configured', 'reservation_session_expired'];
+  const conflictCodes = ['class_status_changed', 'class_closed', 'availability_policy_expired', 'reservation_request_conflict'];
   const status = badRequestCodes.indexOf(code) !== -1 ? 400 :
     (conflictCodes.indexOf(code) !== -1 ? 409 :
     (unauthorizedCodes.indexOf(code) !== -1 ? 401 : 502));
@@ -1203,7 +1278,7 @@ function buildReservationHtml_(liffId) {
     .hint{font-size:12px;line-height:1.6;color:var(--muted);margin-top:5px}.fixed-class{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#f7f9fb;border:1px solid var(--line);border-radius:11px;padding:12px 13px;margin:0 0 16px}.fixed-class span{font-size:13px;color:var(--muted)}.fixed-class strong{font-size:16px;color:var(--navy)}.class-notice{font-size:13px;line-height:1.75;border-radius:11px;padding:12px;margin:-5px 0 16px}.waitlist-notice{background:#fff7e6;color:#7a4a00;border:1px solid #f2d29a}.hidden{display:none!important}
     button{width:100%;border:0;border-radius:13px;padding:14px 16px;font:inherit;font-weight:800;font-size:16px;cursor:pointer}.primary{background:var(--blue);color:#fff;box-shadow:0 7px 18px rgba(22,119,255,.24)}.primary:disabled{opacity:.5;box-shadow:none}.secondary{background:var(--pale);color:var(--navy);margin-top:10px}
     .children-title{font-size:15px;margin:3px 0 10px}.child-card{border:1px solid var(--line);border-radius:14px;padding:15px 13px;margin:0 0 12px;background:#fbfcfd}.child-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px}.child-head h3{font-size:15px;margin:0}.remove-child{width:auto;padding:7px 10px;border:1px solid #e5b7ba;background:#fff;color:#9b2f36;border-radius:9px;font-size:12px}.add-child{margin:0 0 18px;background:#fff;color:var(--blue);border:1px dashed var(--blue)}
-    .status{padding:12px;border-radius:11px;margin:0 0 14px;font-size:13px;line-height:1.6;white-space:pre-line}.loading{background:#eef5fb;color:#335b7c}.error{background:#fff0f1;color:#8b2229}.success{background:#e9f8ef;color:#216c3d;text-align:center;padding:22px}.success h2{font-size:20px;margin:0 0 8px}
+    .status{padding:12px;border-radius:11px;margin:0 0 14px;font-size:13px;line-height:1.6;white-space:pre-line}.loading{background:#eef5fb;color:#335b7c}.error{background:#fff0f1;color:#8b2229}.success{background:#e9f8ef;color:#216c3d;text-align:center;padding:22px}.success h2{font-size:20px;margin:0 0 8px}#receiptNumber{overflow-wrap:anywhere;font-size:12px}
   </style>
 </head>
 <body>
@@ -1229,7 +1304,7 @@ function buildReservationHtml_(liffId) {
       <div class="field"><label for="notes">相談・連絡事項</label><textarea id="notes" name="notes" maxlength="300" placeholder="体操経験や心配なことなど（任意）"></textarea></div>
       <button id="submitButton" class="primary" type="submit" disabled>接続を確認しています…</button>
     </form>
-    <div id="success" class="success hidden"><h2 id="successTitle">予約を受け付けました</h2><p id="chatStatus">担当スタッフが内容を確認後、こちらからLINEいたしますので、しばらくお待ちください。</p><button id="retryChatButton" class="primary hidden" type="button">LINEのトークへ送信する</button><button id="closeButton" class="secondary" type="button">閉じる</button></div>
+    <div id="success" class="success hidden"><h2 id="successTitle">予約を受け付けました</h2><p>お手続きは完了です。この画面を閉じて大丈夫です。</p><p id="receiptNumber"></p><p id="chatStatus">担当スタッフが内容を確認後、こちらからLINEいたしますので、しばらくお待ちください。</p><button id="retryChatButton" class="primary hidden" type="button">LINEのトークへ送信する</button><button id="closeButton" class="secondary" type="button">閉じる</button></div>
   </section>
 </main>
 <script>
@@ -1258,6 +1333,7 @@ function buildReservationHtml_(liffId) {
   let sdkPromise=null;let lineTask=null;let availabilityTask=null;
   let availabilityReady=false;let submitting=false;let completed=false;let preparedRoute='';
   let availabilityProof=null;let policyExpiresAt=0;let receiptTask=null;let receiptSent=false;
+  let identityProof=null;let identityExpiresAt=0;let identityTask=null;
   let routeKey='';let idToken='';let lineReady=false;let pendingRequestId='';let pendingPayloadKey='';let pendingChatMessage='';let pendingReceptionType='reservation';let availableDates=[];let currentFixedClass='';
 
   function routeFromUrl(url){
@@ -1325,6 +1401,7 @@ function buildReservationHtml_(liffId) {
         if(!idToken)throw new Error('MISSING_ID_TOKEN');
         // Receipt delivery is independent of durable reservation acceptance.
         lineReady=true;lineStatus.classList.add('hidden');markPhase('line-ready');
+        void prepareIdentity().catch(()=>{});
       }catch(error){
         lineReady=false;
         const message=error&&error.message;
@@ -1341,6 +1418,17 @@ function buildReservationHtml_(liffId) {
     if(!childrenArea.children.length)addChild();
     if(preparedRoute!==routeKey){preparedRoute=routeKey;restoreDraft()}
     form.classList.remove('hidden');markPhase('form-visible');
+  }
+  function prepareIdentity(){
+    if(identityProof&&Date.now()<identityExpiresAt-30000)return Promise.resolve(identityProof);
+    if(identityTask)return identityTask;
+    const sessionRoute=routeKey;
+    identityTask=postJson('/api/reservations/session',{route:sessionRoute,idToken:liff.getIDToken()||idToken},{attempts:1,timeoutMs:8000}).then(data=>{
+      if(sessionRoute!==routeKey)throw new Error('INVALID_ROUTE');
+      if(!data.identityProof||!Number.isFinite(data.expiresAt))throw new Error('invalid_line_identity');
+      identityProof=data.identityProof;identityExpiresAt=data.expiresAt;markPhase('identity-ready');return identityProof;
+    }).finally(()=>{identityTask=null});
+    return identityTask;
   }
   // A LIFF primary-to-secondary redirect can replace the document while the user types.
   // Only unsent input is kept in this tab for at most 30 minutes; never tokens or receipts.
@@ -1447,7 +1535,7 @@ function buildReservationHtml_(liffId) {
     payload.children.forEach(child=>lines.push('・'+child.name+(child.kana?'（'+child.kana+'）':'')+'／'+child.grade));
     if(payload.referrer)lines.push('紹介してくれた方：'+payload.referrer);
     if(payload.notes)lines.push('相談・連絡事項：'+payload.notes);
-    return lines.join('\\n').slice(0,5000);
+    return lines.join('\\n').slice(0,4850)+'\\n受付番号：FORM-'+payload.requestId;
   }
   function sendReservationToChat(message){
     // Keep one receipt operation even if its UI watchdog fires; a timeout does
@@ -1484,6 +1572,7 @@ function buildReservationHtml_(liffId) {
     statusBox.classList.add('hidden');form.classList.add('hidden');
     document.getElementById('success').classList.remove('hidden');
     successTitle.textContent=type==='waitlist'?'キャンセル待ちを受け付けました':'予約を受け付けました';
+    document.getElementById('receiptNumber').textContent=data.receiptId?'受付番号：'+data.receiptId:'';
     retryChatButton.classList.add('hidden');closeButton.classList.remove('hidden');
     markPhase('accepted-visible');
   }
@@ -1522,12 +1611,13 @@ function buildReservationHtml_(liffId) {
     const payloadKey=JSON.stringify(reservationData);
     if(!pendingRequestId||pendingPayloadKey!==payloadKey){pendingRequestId=requestId();pendingPayloadKey=payloadKey}
     clearDraft();
-    const payload=Object.assign({idToken:idToken,requestId:pendingRequestId,availabilityProof:availabilityProof},reservationData);
+    const payload=Object.assign({requestId:pendingRequestId,availabilityProof:availabilityProof},reservationData);
     pendingReceptionType=receptionType;submitting=true;submitButton.disabled=true;submitButton.textContent=receptionType==='waitlist'?'申し込んでいます…':'予約しています…';statusBox.classList.add('hidden');
     try{
       const receiptMessage=buildReservationChatMessage(payload);
       markPhase('submit-start');
-      const data=await postJson('/api/reservations',payload,{attempts:1,timeoutMs:95000});
+      payload.identityProof=await prepareIdentity();
+      const data=await postJson('/api/reservations',payload,{attempts:2,timeoutMs:8000,onRetry:()=>{setStatus('通信を確認しています。予約が重複することはありません。','loading')}});
       completed=true;markPhase('saved');
       showReservationSuccess(data,receptionType);
       pendingChatMessage=receiptMessage;
@@ -1536,6 +1626,9 @@ function buildReservationHtml_(liffId) {
       console.error('Reservation submission failed',e);
       const code=e&&e.message?String(e.message):'';
       submitting=false;
+      if(['reservation_session_expired','invalid_line_identity'].includes(code)){
+        identityProof=null;identityExpiresAt=0;void prepareIdentity().catch(()=>{});
+      }
       if(['availability_policy_expired','invalid_availability_policy','invalid_experience_date','selected_date_unavailable','class_status_changed','class_closed'].includes(code)){
         setStatus('日程・受付状況を更新します。内容を確認して、もう一度送信してください。','loading');loadAvailability();return;
       }
@@ -1547,6 +1640,7 @@ function buildReservationHtml_(liffId) {
   closeButton.addEventListener('click',()=>{if(window.liff&&liff.isInClient())liff.closeWindow();else location.href='about:blank'});
   retryLineButton.addEventListener('click',()=>connectLine());
   retryAvailabilityButton.addEventListener('click',()=>loadAvailability());
+  form.addEventListener('input',()=>{if(lineReady&&!completed&&(!identityProof||Date.now()>=identityExpiresAt-30000))void prepareIdentity().catch(()=>{})});
   window.addEventListener('pagehide',()=>saveDraft());
   window.addEventListener('online',()=>{
     if(!lineReady&&!retryLineButton.classList.contains('hidden'))connectLine();

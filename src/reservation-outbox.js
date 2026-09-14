@@ -5,7 +5,9 @@ export class ReservationOutbox extends DurableObject {
   async accept(route, payload) {
     if (!this.env.GAS_WEBHOOK_URL || !this.env.GAS_FORWARD_KEY) throw new Error('gas_not_configured');
     if (payload?.source !== 'reservation_form' || !/^[A-Za-z0-9-]{16,80}$/.test(payload.requestId || '') || !/^U[0-9a-f]{32}$/i.test(payload.lineUserId || '')) throw new Error('invalid_request');
-    const canonical = JSON.stringify({ route, payload });
+    // A LINE display-name change does not turn an unchanged retry into a new booking.
+    const { lineDisplayName: _displayName, ...dedupePayload } = payload;
+    const canonical = JSON.stringify({ route, payload: dedupePayload });
     const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical))), b => b.toString(16).padStart(2, '0')).join('');
     return this.ctx.storage.transaction(async txn => {
       const existing = await txn.get('record');
@@ -51,7 +53,8 @@ export class ReservationOutbox extends DurableObject {
       console.log(JSON.stringify({ event: 'reservation_synced', receiptId: record.receiptId, route: record.route, attempts }));
     } catch (_) {
       // Details from GAS may contain private information. Log only the reference.
-      console.error(JSON.stringify({ event: 'reservation_sync_retry', receiptId: record.receiptId, route: record.route, attempts }));
+      console.error(JSON.stringify({ event: 'reservation_sync_retry', receiptId: record.receiptId,
+        objectId: this.ctx.id.toString(), route: record.route, attempts }));
       // The already-committed next alarm survives even if this handler terminates.
     }
   }

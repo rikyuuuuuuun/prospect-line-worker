@@ -7,6 +7,7 @@ export default defineConfig({
     miniflare: { bindings: {
       GAS_WEBHOOK_URL: 'https://gas.invalid/exec', GAS_FORWARD_KEY: 'test-only-key',
       LINE_LOGIN_CHANNEL_ID: 'test-channel',
+      LINE_SECRET_B_TSURUSE: 'test-channel-secret',
     } },
   })],
   test: { include: ['test-worker/*.spec.js'], fileParallelism: false },
