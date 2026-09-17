@@ -4,7 +4,7 @@
   "main": "src/worker.js",
   "compatibility_date": "2026-08-12",
   "triggers": {
-    "crons": ["0 18 * * *"]
+    "crons": ["*/4 * * * *", "1-59/4 * * * *", "2-59/4 * * * *", "3-59/4 * * * *"]
   },
   "exports": {
     "ReservationOutbox": { "type": "durable-object", "storage": "sqlite" },
