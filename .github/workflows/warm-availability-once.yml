@@ -1,0 +1,88 @@
+name: One-time availability warmup
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/warm-availability-once.yml']
+permissions:
+  contents: read
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Wait for snapshot-enabled Worker deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://prospect-line-webhook.line-harness-trampoline.workers.dev'
+          for i in $(seq 1 72); do
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' "$BASE/health/availability-snapshot?route=b%2Ftsuruse" || true)
+            if [ "$code" = '200' ]; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'snapshot-enabled deployment not observed' >&2
+          exit 1
+      - name: Warm all reservation venues now
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://prospect-line-webhook.line-harness-trampoline.workers.dev'
+          routes=(
+            'a/saitama-shibakawa' 'a/sugishita' 'a/mizuhodai' 'a/kamekubo' 'a/ageo-fujimi' 'a/ageo-shibakawa' 'a/kasumigaseki-nishi'
+            'b/tsuruse' 'b/meiho' 'b/omiya-higashi' 'b/tsurugashima-daiichi' 'b/okegawa-nishi' 'b/kitamoto-higashi' 'b/kamihira-kita'
+            'c/katayanagi' 'c/muneoka-daini' 'c/kamine' 'c/kumagaya-nishi' 'c/gyoda-nishi' 'c/asaka-dai10' 'c/tokorozawa-minami' 'c/kurohama-minami'
+            'd/obukuro-higashi' 'd/shimooshi' 'd/izumi' 'd/yagisaki' 'd/nakano' 'd/ebinuma' 'd/komatsu' 'd/shima'
+          )
+          : > /tmp/warm-summary.txt
+          for route in "${routes[@]}"; do
+            body=$(mktemp); headers=$(mktemp)
+            code=$(curl -sS --retry 2 --retry-delay 1 -D "$headers" -o "$body" -w '%{http_code}' \
+              -X POST -H 'content-type: application/json' \
+              --data "{\"route\":\"$route\"}" \
+              "$BASE/api/reservations/availability")
+            cache=$(awk 'BEGIN{IGNORECASE=1} /^x-prospect-cache:/{gsub("\\r",""); print $2}' "$headers" | tail -1)
+            ok=$(python - "$body" <<'PY'
+import json,sys
+try:
+    data=json.load(open(sys.argv[1],encoding='utf-8'))
+    print('true' if data.get('ok') is True else 'false')
+except Exception:
+    print('false')
+PY
+)
+            echo "$route http=$code cache=${cache:-none} ok=$ok" | tee -a /tmp/warm-summary.txt
+            if [ "$code" != '200' ] || [ "$ok" != 'true' ]; then
+              cat "$body" >&2
+              exit 1
+            fi
+            sleep 0.35
+          done
+          cat /tmp/warm-summary.txt
+      - name: Verify all durable snapshots are ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://prospect-line-webhook.line-harness-trampoline.workers.dev'
+          routes=(
+            'a/saitama-shibakawa' 'a/sugishita' 'a/mizuhodai' 'a/kamekubo' 'a/ageo-fujimi' 'a/ageo-shibakawa' 'a/kasumigaseki-nishi'
+            'b/tsuruse' 'b/meiho' 'b/omiya-higashi' 'b/tsurugashima-daiichi' 'b/okegawa-nishi' 'b/kitamoto-higashi' 'b/kamihira-kita'
+            'c/katayanagi' 'c/muneoka-daini' 'c/kamine' 'c/kumagaya-nishi' 'c/gyoda-nishi' 'c/asaka-dai10' 'c/tokorozawa-minami' 'c/kurohama-minami'
+            'd/obukuro-higashi' 'd/shimooshi' 'd/izumi' 'd/yagisaki' 'd/nakano' 'd/ebinuma' 'd/komatsu' 'd/shima'
+          )
+          failed=0
+          for route in "${routes[@]}"; do
+            encoded=${route//\//%2F}
+            state=''
+            for attempt in 1 2 3 4 5; do
+              json=$(curl -sS "$BASE/health/availability-snapshot?route=$encoded" || true)
+              state=$(python -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("state", ""))' <<<"$json" 2>/dev/null || true)
+              [ "$state" = 'ready' ] && break
+              sleep 1
+            done
+            echo "$route state=${state:-unknown}"
+            [ "$state" = 'ready' ] || failed=$((failed+1))
+          done
+          [ "$failed" -eq 0 ] || { echo "$failed snapshots not ready" >&2; exit 1; }
