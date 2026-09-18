@@ -16,31 +16,22 @@ jobs:
         run: |
           set -euo pipefail
           BASE='https://prospect-line-webhook.line-harness-trampoline.workers.dev'
-          route='d/shima'
           success=0
           for attempt in 1 2 3 4 5 6; do
             echo "attempt=$attempt"
             body=$(mktemp)
-            code=$(curl -A 'Mozilla/5.0' -sS -o "$body" -w '%{http_code}' \
-              -X POST -H 'content-type: application/json' \
-              --data '{"route":"d/shima"}' \
-              "$BASE/api/reservations/availability" || true)
-            ok=$(python - "$body" <<'PY'
-import json,sys
-try:
-    d=json.load(open(sys.argv[1],encoding='utf-8'))
-    print('1' if d.get('ok') is True else '0')
-except Exception:
-    print('0')
-PY
-)
-            echo "http=$code ok=$ok"
-            if [ "$code" = 200 ] && [ "$ok" = 1 ]; then success=1; break; fi
+            code=$(curl -A 'Mozilla/5.0' -sS -o "$body" -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{"route":"d/shima"}' "$BASE/api/reservations/availability" || true)
+            if [ "$code" = 200 ] && jq -e '.ok == true' "$body" >/dev/null 2>&1; then
+              success=1
+              break
+            fi
+            echo "http=$code"
+            cat "$body" || true
             sleep 3
           done
           [ "$success" = 1 ]
           for n in 1 2 3 4 5; do
-            state=$(curl -A 'Mozilla/5.0' -sS "$BASE/health/availability-snapshot?route=d%2Fshima" | python -c "import json,sys; print(json.load(sys.stdin).get('state',''))")
+            state=$(curl -A 'Mozilla/5.0' -sS "$BASE/health/availability-snapshot?route=d%2Fshima" | jq -r '.state // empty')
             [ "$state" = ready ] && break
             sleep 1
           done
