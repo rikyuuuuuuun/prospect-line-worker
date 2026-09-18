@@ -20,17 +20,13 @@ const TEAM_ROUTES = Object.freeze({
   C: Object.freeze(RESERVATION_ROUTES.filter(route => route.startsWith('c/'))),
   D: Object.freeze(RESERVATION_ROUTES.filter(route => route.startsWith('d/'))),
 });
-// Permanent 03:00 JST batch schedule plus temporary every-four-minute bootstrap schedule.
-// The temporary expressions are harmless when they are not present in wrangler.jsonc.
+// Split the daily 03:00 JST preload into four small invocations so each stays
+// safely below Cloudflare's per-invocation external subrequest budget.
 const CRON_TEAM = Object.freeze({
   '0 18 * * *': 'A',
   '2 18 * * *': 'B',
   '4 18 * * *': 'C',
   '6 18 * * *': 'D',
-  '*/4 * * * *': 'A',
-  '1-59/4 * * * *': 'B',
-  '2-59/4 * * * *': 'C',
-  '3-59/4 * * * *': 'D',
 });
 const SNAPSHOT_MIN_REMAINING_MS = 60000;
 
