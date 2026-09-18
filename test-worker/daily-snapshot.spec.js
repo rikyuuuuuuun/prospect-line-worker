@@ -58,3 +58,25 @@ it('reports durable snapshot readiness without exposing the snapshot body', asyn
   expect(status.body).toBeUndefined();
   expect(network).not.toHaveBeenCalled();
 });
+
+it('refreshes one venue inside its durable object and stores a signed ready snapshot', async () => {
+  const generatedAt=Date.now();
+  network.mockImplementationOnce(async()=>Response.json({
+    ok:true,
+    dates:[{value:'2026-10-01',label:'10月1日'}],
+    classes:[{value:'前半',label:'前半',time:'',status:'open'},{value:'後半',label:'後半',time:'',status:'waitlist'}],
+    fixedClass:'',
+    fallback:false,
+    generatedAt,
+  }));
+  const refreshed=await snapshot().refresh(route);
+  expect(refreshed.ok).toBe(true);
+  expect(refreshed.source).toBe('cron');
+  expect(network).toHaveBeenCalledTimes(1);
+  const record=await snapshot().get();
+  const body=JSON.parse(record.body);
+  expect(body.ok).toBe(true);
+  expect(body.availabilityProof.signature).toMatch(/^[0-9a-f]{64}$/);
+  expect(body.policyExpiresAt).toBe(generatedAt+86400000);
+  expect((await snapshot().status()).state).toBe('ready');
+});

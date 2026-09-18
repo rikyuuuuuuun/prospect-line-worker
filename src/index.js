@@ -358,6 +358,19 @@ async function deliverReservationAvailability_(payload, env, routeKey, state, st
     policyExpiresAt: payload.generatedAt + RESERVATION_UPSTREAM_MAX_AGE_MS }, 200), state, startedAt);
 }
 
+export async function buildReservationAvailabilitySnapshot_(env, rawRoute) {
+  const routeKey = requireRoute_(rawRoute);
+  let payload = await loadReservationAvailabilityPayload_(
+    env, routeKey, false, Date.now() + RESERVATION_READ_BUDGET_MS
+  );
+  payload = { ...payload, dates: payload.dates.filter(item => isBookableDate_(item.value)) };
+  const availabilityProof = await signReservationPolicy_(env, routeKey, payload);
+  return {
+    ...payload,
+    availabilityProof,
+    policyExpiresAt: payload.generatedAt + RESERVATION_UPSTREAM_MAX_AGE_MS,
+  };
+}
 async function handleReservationAvailability_(request, env, ctx) {
   const startedAt = Date.now();
   try {
