@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
+import { buildReservationAvailabilitySnapshot_ } from './index.js';
 
 // Public reservation availability only. No LINE IDs, names, tokens, or secrets are stored here.
 export class AvailabilitySnapshot extends DurableObject {
@@ -27,6 +28,17 @@ export class AvailabilitySnapshot extends DurableObject {
       refreshedAt: stored.refreshedAt, source: stored.source };
   }
 
+  async refresh(routeKey) {
+    const payload = await buildReservationAvailabilitySnapshot_(this.env, routeKey);
+    const source = payload.fallback ? 'cron-fallback' : 'cron';
+    return this.put({
+      body: JSON.stringify(payload),
+      generatedAt: Number(payload.generatedAt),
+      policyExpiresAt: Number(payload.policyExpiresAt),
+      refreshedAt: Date.now(),
+      source,
+    });
+  }
   async status() {
     const record = await this.ctx.storage.get('record');
     if (!record) return { ok: true, state: 'empty' };
