@@ -14,6 +14,20 @@ const RESERVATION_ROUTES = Object.freeze([
   'd/nakano', 'd/ebinuma', 'd/komatsu', 'd/shima',
 ]);
 const ROUTE_SET = new Set(RESERVATION_ROUTES);
+const TEAM_ROUTES = Object.freeze({
+  A: Object.freeze(RESERVATION_ROUTES.filter(route => route.startsWith('a/'))),
+  B: Object.freeze(RESERVATION_ROUTES.filter(route => route.startsWith('b/'))),
+  C: Object.freeze(RESERVATION_ROUTES.filter(route => route.startsWith('c/'))),
+  D: Object.freeze(RESERVATION_ROUTES.filter(route => route.startsWith('d/'))),
+});
+// Split the daily 03:00 JST preload into four small invocations so each stays
+// safely below Cloudflare's per-invocation external subrequest budget.
+const CRON_TEAM = Object.freeze({
+  '0 18 * * *': 'A',
+  '2 18 * * *': 'B',
+  '4 18 * * *': 'C',
+  '6 18 * * *': 'D',
+});
 const SNAPSHOT_MIN_REMAINING_MS = 60000;
 
 function availabilitySnapshot_(ctx, routeKey) {
@@ -117,17 +131,20 @@ function jstDate_(value) {
   return map.year + map.month + map.day;
 }
 
-async function refreshDailyAvailability_(scheduledTime, env, ctx) {
+async function refreshDailyAvailability_(scheduledTime, env, ctx, routes, batchName) {
   const refreshDate = jstDate_(Number(scheduledTime) || Date.now());
-  const origin = 'https://refresh-' + refreshDate + '.prospect.invalid';
+  const batch = String(batchName || 'batch').toLowerCase();
+  const origin = 'https://refresh-' + refreshDate + '-' + batch + '.prospect.invalid';
   const failures = [];
   let refreshed = 0;
+  const targetRoutes = Array.isArray(routes) && routes.length ? routes : RESERVATION_ROUTES;
 
-  // Sequential reads are deliberate: GAS/Sheets should never receive a 30-request burst at 03:00.
-  for (const routeKey of RESERVATION_ROUTES) {
+  // Keep each scheduled invocation below Cloudflare's external subrequest budget.
+  // GAS is read sequentially so Sheets never receives a burst from a single team batch.
+  for (const routeKey of targetRoutes) {
     try {
-      // A date-specific synthetic origin gives the core Cache API a new key each day,
-      // guaranteeing that this 03:00 job reaches GAS instead of reusing yesterday's edge cache.
+      // A date-and-batch-specific synthetic origin gives the core Cache API a new key each day,
+      // guaranteeing that the 03:00 job reaches GAS instead of reusing yesterday's edge cache.
       const request = new Request(origin + '/api/reservations/availability', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -135,8 +152,9 @@ async function refreshDailyAvailability_(scheduledTime, env, ctx) {
       });
       const response = await core.fetch(request, env, ctx);
       if (!response.ok) throw new Error('availability_http_' + response.status);
+      const fallback = response.headers.get('x-prospect-cache') === 'FALLBACK';
       if (!await storeDailySnapshot_(ctx, routeKey, response,
-        response.headers.get('x-prospect-cache') === 'FALLBACK' ? 'cron-fallback' : 'cron')) {
+        fallback ? 'cron-' + batch + '-fallback' : 'cron-' + batch)) {
         throw new Error('availability_snapshot_invalid');
       }
       refreshed += 1;
@@ -145,10 +163,10 @@ async function refreshDailyAvailability_(scheduledTime, env, ctx) {
     }
   }
 
-  console.log(JSON.stringify({ event: 'daily_availability_refresh', refreshDate,
+  console.log(JSON.stringify({ event: 'daily_availability_refresh', refreshDate, batch,
     refreshed, failed: failures.length, failures }));
-  if (failures.length) throw new Error('daily_availability_refresh_failed_' + failures.length);
-  return { ok: true, refreshDate, refreshed };
+  if (failures.length) throw new Error('daily_availability_refresh_' + batch + '_failed_' + failures.length);
+  return { ok: true, refreshDate, batch, refreshed };
 }
 
 async function handleSnapshotHealth_(request, ctx) {
@@ -185,6 +203,12 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    ctx.waitUntil(refreshDailyAvailability_(controller?.scheduledTime, env, ctx));
+    const cron = String(controller?.cron || '');
+    const team = CRON_TEAM[cron];
+    if (!team || !TEAM_ROUTES[team]) {
+      console.warn(JSON.stringify({ event: 'availability_cron_ignored', cron }));
+      return;
+    }
+    ctx.waitUntil(refreshDailyAvailability_(controller?.scheduledTime, env, ctx, TEAM_ROUTES[team], team));
   },
 };
