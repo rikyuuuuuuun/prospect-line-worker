@@ -3,6 +3,30 @@ import { buildReservationAvailabilitySnapshot_ } from './index.js';
 
 // Public reservation availability only. No LINE IDs, names, tokens, or secrets are stored here.
 export class AvailabilitySnapshot extends DurableObject {
+  // All routes change in one transaction. No TTL, alarms, or origin read on get.
+  async getTrialConfig(route) {
+    const records = await this.ctx.storage.get(['trial:meta', 'trial:route:' + route]);
+    const meta = records.get('trial:meta');
+    const config = records.get('trial:route:' + route);
+    return meta && config ? { ...meta, config } : null;
+  }
+
+  async putTrialConfig(bundle, digest) {
+    return this.ctx.storage.transaction(async txn => {
+      const previous = await txn.get('trial:meta');
+      if (previous && bundle.revision < previous.revision) throw Error('trial_config_out_of_order');
+      if (previous && bundle.revision === previous.revision && digest !== previous.digest) throw Error('trial_config_revision_conflict');
+      if (previous?.digest === digest) {
+        // Advance the ordering watermark without rewriting any route or its content timestamp.
+        if (bundle.revision > previous.revision) await txn.put('trial:meta', { ...previous, revision: bundle.revision });
+        return { ok: true, unchanged: true, revision: bundle.revision, digest };
+      }
+      const values = { 'trial:meta': { revision: bundle.revision, digest, updatedAt: Date.now() } };
+      for (const [route, config] of Object.entries(bundle.byRoute)) values['trial:route:' + route] = config;
+      await txn.put(values);
+      return { ok: true, unchanged: false, revision: bundle.revision, digest };
+    });
+  }
   async get() {
     const record = await this.ctx.storage.get('record');
     return record || null;

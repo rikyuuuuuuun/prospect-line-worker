@@ -5,7 +5,7 @@ Cloudflare Worker for the Prospect LINE webhook gateway, LIFF trial reservation 
 ## Production Worker
 
 - Worker name: `prospect-line-webhook`
-- Entry point: `src/index.js`
+- Entry point: `src/worker.js` (reservation/activity core: `src/index.js`)
 - Deploy: `npm run deploy`
 - Dry run: `npm run check`
 
@@ -37,4 +37,6 @@ GitHub-to-Cloudflare automatic deployment is enabled for the `main` branch.
 
 ## Reservation performance
 
-See [submission redesign](docs/reservation-submit-redesign.md) for the current 24-hour public-policy freshness rule, signed validation and receipt delivery after durable acceptance. This supersedes the older forced live-policy check described in REPAIR-P06.md.
+See [persistent trial config](docs/persistent-trial-config.md) for the startup path, GAS change synchronization, measurement results and required activation sequence. Config has no TTL; the independently issued submission proof remains valid for 24 hours. The reservation outbox, identity validation and receipt flow remain as described in [submission redesign](docs/reservation-submit-redesign.md).
+
+**Release prerequisite:** seed and validate the persistent configuration before switching production traffic. `main` deploys automatically; this change must not be merged with an empty config store or without the GAS synchronizer installed. No browser request falls back to Sheets to bootstrap an empty store.

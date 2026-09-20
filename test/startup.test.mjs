@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { Window } from 'happy-dom';
 
-const source = (await readFile(new URL('../src/index.js', import.meta.url), 'utf8')).replace(/^export \{ ReservationOutbox \} from .*;$/m, '').replace('export async function buildReservationAvailabilitySnapshot_', 'async function buildReservationAvailabilitySnapshot_').replace('export default {', 'globalThis.worker = {');
+const source = (await readFile(new URL('../src/index.js', import.meta.url), 'utf8')).replace(/^export \{ ReservationOutbox \} from .*;$/m, '').replace('export async function buildReservationAvailabilitySnapshot_', 'async function buildReservationAvailabilitySnapshot_').replace(/export async function /g, 'async function ').replace('export default {', 'globalThis.worker = {');
 const route = 'b/tsuruse';
 const good = () => ({ ok: true, availabilityProof:{payload:'fixture',signature:'fixture'}, policyExpiresAt:Date.now()+86400000, generatedAt: Date.now(), dates: [{value:'2026-09-20',label:'9月20日'}], classes: [{value:'前半',status:'open'},{value:'後半',status:'waitlist'}] });
 const deferred = () => { let resolve, reject; const promise = new Promise((yes,no) => {resolve=yes;reject=no}); return {promise,resolve,reject}; };
@@ -157,7 +157,7 @@ test('cache failure does not discard good availability; POST never receives the 
   c.forwardAvailabilityToGas_=async()=>good();
   const response=await c.handleReservationAvailability_(new Request('https://fixture.invalid/api/reservations/availability',{method:'POST',body:JSON.stringify({route})}),{GAS_FORWARD_KEY:'fixture-signing-key'},{});
   assert.equal(response.status,200);assert.equal(response.headers.get('cache-control'),'no-store');assert.equal(response.headers.get('x-prospect-cache'),'MISS');
-  assert.match(response.headers.get('server-timing'),/^availability;dur=\d+$/);
+  assert.match(response.headers.get('server-timing'),/^availability;dur=\d+, edge;dur=\d+, gas;dur=\d+$/);
 });
 
 test('a fresh edge hit does not reach GAS or LINE',async()=>{

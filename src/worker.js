@@ -1,8 +1,8 @@
-import core, { ReservationOutbox } from './index.js';
+import core, { ReservationOutbox, deliverTrialConfig_ } from './index.js';
+import legacyAvailability from './legacy-availability.js';
 import { AvailabilitySnapshot } from './availability-snapshot.js';
-
+import { configDigest, verifyConfigPush, normalizeTrialConfig, currentTrialWindow, TRIAL_CONFIG_MAX_BYTES } from './trial-config.js';
 export { ReservationOutbox, AvailabilitySnapshot };
-
 const RESERVATION_ROUTES = Object.freeze([
   'a/saitama-shibakawa', 'a/sugishita', 'a/mizuhodai', 'a/kamekubo',
   'a/ageo-fujimi', 'a/ageo-shibakawa', 'a/kasumigaseki-nishi',
@@ -14,158 +14,75 @@ const RESERVATION_ROUTES = Object.freeze([
   'd/nakano', 'd/ebinuma', 'd/komatsu', 'd/shima',
 ]);
 const ROUTE_SET = new Set(RESERVATION_ROUTES);
-const SNAPSHOT_MIN_REMAINING_MS = 60000;
 
-function availabilitySnapshot_(ctx, routeKey) {
-  if (!ctx?.exports?.AvailabilitySnapshot) return null;
-  return ctx.exports.AvailabilitySnapshot.getByName(
-    JSON.stringify(['daily-availability-v1', routeKey]),
-    { locationHint: 'apac' }
-  );
+function store(ctx) {
+  return ctx?.exports?.AvailabilitySnapshot?.getByName('trial-config-v1', { locationHint: 'apac' });
 }
-
-async function requestRoute_(request) {
+function json(body, status=200, timing='') {
+  return Response.json(body, {status, headers:{'cache-control':'no-store','x-content-type-options':'nosniff',
+    'x-prospect-cache':'PERSISTENT-CONFIG','server-timing':timing}});
+}
+async function readBounded(request, limit) {
+  if (Number(request.headers.get('content-length')) > limit) throw Error('request_too_large');
+  const reader=request.body?.getReader();
+  if (!reader) return '';
+  const decoder=new TextDecoder(); let text='', size=0;
+  try { for (;;) { const {done,value}=await reader.read(); if(done)break; size+=value.byteLength;
+    if(size>limit) { await reader.cancel(); throw Error('request_too_large'); } text+=decoder.decode(value,{stream:true}); }
+    return text+decoder.decode();
+  } finally {reader.releaseLock();}
+}
+async function deliver(request,env,ctx) {
+  const started=Date.now(); let readMs=0;
   try {
-    const text = await request.clone().text();
-    if (!text || text.length > 32000) return '';
-    const route = String(JSON.parse(text)?.route || '').toLowerCase().replace(/^\/+|\/+$/g, '');
-    return ROUTE_SET.has(route) ? route : '';
-  } catch (_) {
-    return '';
+    const raw=request.method==='GET'?new URL(request.url).searchParams.get('route'):JSON.parse(await readBounded(request,32000)).route;
+    const route=String(raw||'').toLowerCase().replace(/^\/+|\/+$/g,'');
+    if(!ROUTE_SET.has(route))return json({ok:false,message:'invalid_route'},400);
+    const object=store(ctx); if(!object)throw Error('trial_config_unavailable');
+    const readStarted=Date.now(); const record=await object.getTrialConfig(route); readMs=Date.now()-readStarted;
+    // An empty store is an operator/bootstrap issue, never a reason to read Sheets in a user's request.
+    if(!record)return json({ok:false,message:'trial_config_not_initialized'},503);
+    const body=await deliverTrialConfig_(env,route,record,currentTrialWindow(record.config.dates));
+    const workerMs=Date.now()-started;
+    console.log(JSON.stringify({event:'trial_config_timing',configMs:readMs,workerMs,gasMs:0}));
+    return json(body,200,'config;dur='+readMs+', gas;dur=0, worker;dur='+workerMs);
+  }catch(error){
+    const message=['request_too_large'].includes(error.message)?error.message:'trial_config_unavailable';
+    console.warn(JSON.stringify({event:'trial_config_read_failed',message}));
+    return json({ok:false,message},message==='request_too_large'?413:503,'worker;dur='+(Date.now()-started));
   }
 }
-
-async function readDailySnapshot_(ctx, routeKey, startedAt) {
-  const object = availabilitySnapshot_(ctx, routeKey);
-  if (!object) return null;
+async function push(request,env,ctx) {
   try {
-    const record = await object.get();
-    if (!record || typeof record.body !== 'string' ||
-        !Number.isFinite(record.policyExpiresAt) ||
-        record.policyExpiresAt <= Date.now() + SNAPSHOT_MIN_REMAINING_MS) return null;
-    let payload;
-    try { payload = JSON.parse(record.body); } catch (_) { return null; }
-    if (!payload || payload.ok !== true || !Array.isArray(payload.dates) ||
-        !Array.isArray(payload.classes) || !payload.availabilityProof) return null;
-    return new Response(record.body, {
-      status: 200,
-      headers: {
-        'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-store',
-        'x-content-type-options': 'nosniff',
-        'x-prospect-cache': 'DAILY-SNAPSHOT',
-        'server-timing': 'availability;dur=' + Math.max(0, Date.now() - startedAt),
-      },
-    });
-  } catch (error) {
-    console.warn(JSON.stringify({ event: 'availability_snapshot_read_failed', route: routeKey,
-      message: String(error?.message || 'snapshot_read_failed') }));
-    return null;
+    const body=await readBounded(request,TRIAL_CONFIG_MAX_BYTES);
+    if(!await verifyConfigPush(request,body,env.GAS_FORWARD_KEY))return json({ok:false,message:'unauthorized'},401);
+    const bundle=normalizeTrialConfig(JSON.parse(body),RESERVATION_ROUTES);
+    const digest=await configDigest(JSON.stringify(bundle.byRoute));
+    const object=store(ctx);if(!object)throw Error('trial_config_unavailable');
+    return json(await object.putTrialConfig(bundle,digest));
+  }catch(error){
+    const known=['invalid_trial_config','trial_config_out_of_order','trial_config_revision_conflict','request_too_large'];
+    const message=known.includes(error.message)?error.message:'trial_config_update_failed';
+    const status=message==='request_too_large'?413:message==='invalid_trial_config'?400:message.startsWith('trial_config_revision')||message==='trial_config_out_of_order'?409:503;
+    return json({ok:false,message},status);
   }
 }
-
-async function snapshotRecordFromResponse_(response, source) {
-  if (!response || !response.ok) return null;
-  const body = await response.clone().text();
-  if (!body || body.length > 20000) return null;
-  let payload;
-  try { payload = JSON.parse(body); } catch (_) { return null; }
-  const generatedAt = Number(payload?.generatedAt);
-  const policyExpiresAt = Number(payload?.policyExpiresAt);
-  if (payload?.ok !== true || !Number.isFinite(generatedAt) || !Number.isFinite(policyExpiresAt) ||
-      policyExpiresAt <= Date.now() + SNAPSHOT_MIN_REMAINING_MS || !payload.availabilityProof) return null;
-  return { body, generatedAt, policyExpiresAt, refreshedAt: Date.now(), source };
-}
-
-async function storeDailySnapshot_(ctx, routeKey, response, source) {
-  const object = availabilitySnapshot_(ctx, routeKey);
-  if (!object) return false;
-  const record = await snapshotRecordFromResponse_(response, source);
-  if (!record) return false;
-  await object.put(record);
-  return true;
-}
-
-async function handleAvailability_(request, env, ctx) {
-  const startedAt = Date.now();
-  const routeKey = await requestRoute_(request);
-  if (routeKey) {
-    const snapshot = await readDailySnapshot_(ctx, routeKey, startedAt);
-    if (snapshot) return snapshot;
-  }
-
-  const response = await core.fetch(request, env, ctx);
-  if (routeKey && response.ok) {
-    const source = 'request-' + String(response.headers.get('x-prospect-cache') || 'origin').toLowerCase();
-    const write = storeDailySnapshot_(ctx, routeKey, response, source).catch(error => {
-      console.warn(JSON.stringify({ event: 'availability_snapshot_write_failed', route: routeKey,
-        message: String(error?.message || 'snapshot_write_failed') }));
-      return false;
-    });
-    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(write);
-    else await write;
-  }
-  return response;
-}
-
-async function refreshDailyAvailability_(scheduledTime, ctx) {
-  const failures = [];
-  let refreshed = 0;
-  for (const routeKey of RESERVATION_ROUTES) {
-    try {
-      const object = availabilitySnapshot_(ctx, routeKey);
-      if (!object) throw new Error('availability_snapshot_unavailable');
-      const result = await object.refresh(routeKey);
-      if (!result || result.ok !== true) throw new Error('availability_snapshot_refresh_failed');
-      refreshed += 1;
-    } catch (error) {
-      failures.push({ route: routeKey, message: String(error?.message || 'refresh_failed') });
-    }
-  }
-  console.log(JSON.stringify({ event: 'daily_availability_refresh', scheduledTime,
-    refreshed, failed: failures.length, failures }));
-  if (failures.length) throw new Error('daily_availability_refresh_failed_' + failures.length);
-  return { ok: true, refreshed };
-}
-async function handleSnapshotHealth_(request, ctx) {
-  const routeKey = String(new URL(request.url).searchParams.get('route') || '')
-    .toLowerCase().replace(/^\/+|\/+$/g, '');
-  if (!ROUTE_SET.has(routeKey)) {
-    return Response.json({ ok: false, message: 'invalid_route' }, { status: 400,
-      headers: { 'cache-control': 'no-store' } });
-  }
-  const object = availabilitySnapshot_(ctx, routeKey);
-  if (!object) return Response.json({ ok: false, message: 'availability_snapshot_unavailable' },
-    { status: 503, headers: { 'cache-control': 'no-store' } });
-  try {
-    const status = await object.status();
-    return Response.json({ route: routeKey, ...status }, { status: 200,
-      headers: { 'cache-control': 'no-store' } });
-  } catch (_) {
-    return Response.json({ ok: false, route: routeKey, message: 'availability_snapshot_unavailable' },
-      { status: 503, headers: { 'cache-control': 'no-store' } });
-  }
-}
-
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname.toLowerCase().replace(/^\/+|\/+$/g, '');
-    if (request.method === 'POST' && path === 'api/reservations/availability') {
-      return handleAvailability_(request, env, ctx);
+  async fetch(request,env,ctx) {
+    const path=new URL(request.url).pathname.toLowerCase().replace(/^\/+|\/+$/g,'');
+    // Explicit one-time migration mode only. Never an automatic miss/error fallback.
+    // Lets the signed push endpoint seed storage before production forms switch.
+    if (env.TRIAL_CONFIG_BRIDGE_ONLY === 'true' && request.method==='POST' &&
+        path==='api/reservations/availability') return legacyAvailability.fetch(request,env,ctx);
+    if ((request.method==='GET' && path==='trial-config') ||
+        (request.method==='POST' && path==='api/reservations/availability')) return deliver(request,env,ctx);
+    if (request.method==='POST' && path==='internal/trial-config')return push(request,env,ctx);
+    if(request.method==='GET' && path==='health/availability-snapshot'){
+      const route=new URL(request.url).searchParams.get('route');
+      if(!ROUTE_SET.has(route))return json({ok:false,message:'invalid_route'},400);
+      try {const r=await store(ctx)?.getTrialConfig(route); return json({ok:!!r,state:r?'ready':'empty',revision:r?.revision,configVersion:r?.digest},r?200:503);}
+      catch(_){return json({ok:false,state:'unavailable'},503);}
     }
-    if (request.method === 'GET' && path === 'health/availability-snapshot') {
-      return handleSnapshotHealth_(request, ctx);
-    }
-    return core.fetch(request, env, ctx);
-  },
-
-  async scheduled(controller, env, ctx) {
-    const cron = String(controller?.cron || '');
-    if (cron !== '0 18 * * *') {
-      console.warn(JSON.stringify({ event: 'availability_cron_ignored', cron }));
-      return;
-    }
-    ctx.waitUntil(refreshDailyAvailability_(controller?.scheduledTime, ctx));
+    return core.fetch(request,env,ctx);
   },
 };
