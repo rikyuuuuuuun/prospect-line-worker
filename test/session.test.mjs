@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
-const source=(await readFile(new URL('../src/index.js',import.meta.url),'utf8')).replace(/^export \{ ReservationOutbox \} from .*;$/m,'').replace('export async function buildReservationAvailabilitySnapshot_','async function buildReservationAvailabilitySnapshot_').replace('export default {','globalThis.worker = {');
+const source=(await readFile(new URL('../src/index.js',import.meta.url),'utf8')).replace(/^export \{ ReservationOutbox \} from .*;$/m,'').replace('export async function buildReservationAvailabilitySnapshot_','async function buildReservationAvailabilitySnapshot_').replace(/export async function /g, 'async function ').replace('export default {','globalThis.worker = {');
 const env={GAS_FORWARD_KEY:'test-key',LINE_LOGIN_CHANNEL_ID:'test-channel'};
 const route='b/tsuruse';
 function setup(extra={}) { const c={Request,Response,Headers,URL,URLSearchParams,TextEncoder,TextDecoder,AbortController,setTimeout,clearTimeout,crypto:globalThis.crypto,Date,console,...extra};vm.createContext(c);vm.runInContext(source,c);return c; }
@@ -51,3 +51,4 @@ test('only a receipt tied to the verified sender and an accepted reservation is 
   const empty={exports:{ReservationOutbox:{getByName:()=>({status:async()=>null})}}};
   assert.equal(await c.isAcceptedReservationReceipt_(empty,route,event),false);
 });
+

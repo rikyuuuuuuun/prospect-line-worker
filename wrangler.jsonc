@@ -3,15 +3,25 @@
   "name": "prospect-line-webhook",
   "main": "src/worker.js",
   "compatibility_date": "2026-08-12",
+  "vars": { "TRIAL_CONFIG_BRIDGE_ONLY": "true" },
   "triggers": {
-    "crons": ["0 18 * * *"]
+    "crons": []
   },
   "exports": {
-    "ReservationOutbox": { "type": "durable-object", "storage": "sqlite" },
-    "AvailabilitySnapshot": { "type": "durable-object", "storage": "sqlite" }
+    "ReservationOutbox": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "AvailabilitySnapshot": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
   },
   "observability": {
     "enabled": true,
-    "logs": { "enabled": true, "invocation_logs": false }
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false
+    }
   }
 }

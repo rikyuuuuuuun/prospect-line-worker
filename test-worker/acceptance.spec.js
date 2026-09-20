@@ -35,6 +35,22 @@ it('the production HTTP handler accepts into SQLite without any LINE or GAS requ
   expect((await(await post('/api/reservations',data)).json()).duplicate).toBe(true);
 });
 
+it('a persisted-config policy accepts the unchanged referral and child payload without GAS',async()=>{
+  const data=await booking();data.referrer='紹介者テスト';
+  const config={dates:[],classes:[{value:'後半',label:'後半',status:'waitlist',time:'11:00'}],fixedClass:''};
+  await exports.AvailabilitySnapshot.getByName('trial-config-v1').putTrialConfig(
+    {revision:Date.now()-30*86400000,byRoute:{[route]:config}},'fixture-digest');
+  const form=await(await exports.default.fetch('https://fixture.invalid/trial-config?route='+route)).json();
+  data.availabilityProof=form.availabilityProof;
+  expect((await post('/api/reservations',data)).status).toBe(200);
+  await runInDurableObject(object(data),async(_,state)=>{
+    const saved=await state.storage.get('record');expect(saved.payload.referrer).toBe(data.referrer);
+    expect(saved.payload.children[0].name).toBe('synthetic');
+  });
+  expect((await(await post('/api/reservations',data)).json()).duplicate).toBe(true);
+  expect(network).not.toHaveBeenCalled();
+});
+
 it('the session endpoint verifies LINE once and issues a locally usable proof',async()=>{
   network.mockImplementationOnce(async()=>Response.json({sub:userId,aud:env.LINE_LOGIN_CHANNEL_ID,exp:Date.now()/1000+3600,name:'synthetic'}));
   const session=await(await post('/api/reservations/session',{route,idToken:'synthetic-id-token'})).json();

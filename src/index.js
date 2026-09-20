@@ -61,12 +61,12 @@ const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 // 活動申込は全会場共通URLで使います。GAS転送時だけ既存の有効ルートを内部利用します。
 const ACTIVITY_GAS_ROUTE = 'a/saitama-shibakawa';
 const ACTIVITY_LIFF_ID = '2011040394-O4z7w36C';
-const WORKER_BUILD = '2026-09-14-reservation-durable-accept';
-const WORKER_RELEASE = '2026-09-14-reservation-durable-accept';
+const WORKER_BUILD = '2026-09-20-persistent-trial-config';
+const WORKER_RELEASE = '2026-09-20-persistent-trial-config';
 const RESERVATION_READ_BUDGET_MS = 8000;
 const EXPECTED_GAS_BUILD = '2026-08-13-single-slot-auto1';
-// Owner-approved policy: public dates/class states may lag by up to 24 hours.
-// Original generation time bounds both the edge cache and signed form policy.
+// Submit proofs live for 24h. Persistent source config has no TTL; its revision
+// and the proof's issuance time are separate. Legacy cache helpers retain their age checks.
 // Identity verification and durable reservation storage remain synchronous.
 const RESERVATION_UPSTREAM_MAX_AGE_MS = 86400000;
 const RESERVATION_POLICY_PURPOSE = 'prospect-reservation-policy-v1';
@@ -227,14 +227,14 @@ function reservationAvailabilityResponse_(payload, cachedAt) {
   });
 }
 
-async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh, deadlineAt) {
+async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh, deadlineAt, timing) {
   const requestBody = JSON.stringify({
     source: forceRefresh ? 'reservation_availability_refresh' : 'reservation_availability',
   });
   // 初期表示は専用の有限リトライを使います。GASの正常応答を待てる長さを確保しつつ、
   // 無限待機やブラウザ側からの多重送信を避けます。
   const deadline = deadlineAt || Date.now() + RESERVATION_READ_BUDGET_MS;
-  const result = await forwardAvailabilityToGas_(env, routeKey, requestBody, deadline);
+  const result = await forwardAvailabilityToGas_(env, routeKey, requestBody, deadline, timing);
   if (!result) throw new Error('gas_empty_response');
   if (result.ok === false) throw new Error(mapGasRejection_(result.message));
   if (!Array.isArray(result.dates)) throw new Error('gas_wrong_or_old_backend');
@@ -242,7 +242,7 @@ async function loadReservationAvailabilityPayload_(env, routeKey, forceRefresh, 
   // Unverifiable/old snapshots require one bounded live refresh; they never
   // become fresh merely because this Worker received them again.
   if (!forceRefresh && !isVerifiedUpstreamAvailabilityAge_(result)) {
-    return loadReservationAvailabilityPayload_(env, routeKey, true, deadline);
+    return loadReservationAvailabilityPayload_(env, routeKey, true, deadline, timing);
   }
   if (!isVerifiedUpstreamAvailabilityAge_(result) || (forceRefresh && result.fallback)) {
     throw new Error('availability_unverified_fallback');
@@ -335,6 +335,22 @@ async function signReservationPolicy_(env, routeKey, availability) {
   return { payload, signature: Array.from(new Uint8Array(signature), b => b.toString(16).padStart(2, '0')).join('') };
 }
 
+// Config freshness and short-lived submit authorization are deliberately separate.
+// This issues a new policy, never a new source timestamp or a fresh Sheets read.
+export async function deliverTrialConfig_(env, routeKey, record, dates) {
+  requireRoute_(routeKey);
+  const policyIssuedAt = Date.now();
+  const fixedClass = record.config.fixedClass || ROUTES[routeKey].fixedClass || '';
+  const config = { ...record.config, fixedClass,
+    classes: fixedClass ? record.config.classes.filter(item => item.value === fixedClass) : record.config.classes };
+  if (!config.classes.length) throw new Error('invalid_trial_config');
+  const availabilityProof = await signReservationPolicy_(env, routeKey,
+    { ...config, dates, generatedAt: policyIssuedAt });
+  return { ok: true, ...config, dates, generatedAt: record.revision,
+    configVersion: record.digest, policyIssuedAt,
+    policyExpiresAt: policyIssuedAt + RESERVATION_UPSTREAM_MAX_AGE_MS, availabilityProof };
+}
+
 async function readReservationPolicy_(env, routeKey, proof) {
   if (!proof || typeof proof.payload !== 'string' || proof.payload.length > 8000 ||
       typeof proof.signature !== 'string' || !/^[0-9a-f]{64}$/.test(proof.signature)) throw new Error('invalid_availability_policy');
@@ -373,28 +389,39 @@ export async function buildReservationAvailabilitySnapshot_(env, rawRoute) {
 }
 async function handleReservationAvailability_(request, env, ctx) {
   const startedAt = Date.now();
+  const timing = { gas: 0, gasAttempts: 0, edge: 0 };
+  function finish(response) {
+    response.headers.append('server-timing', 'edge;dur=' + timing.edge + ', gas;dur=' + timing.gas);
+    console.log?.(JSON.stringify({ event: 'reservation_availability_timing',
+      cache: response.headers.get('x-prospect-cache'), status: response.status,
+      gasAttempts: timing.gasAttempts, gasMs: timing.gas, edgeMs: timing.edge,
+      coreMs: Math.max(0, Date.now() - startedAt) }));
+    return response;
+  }
   try {
     const body = await readJsonBody_(request);
     const routeKey = requireRoute_(body.route);
     const cacheKey = reservationAvailabilityCacheKey_(request, routeKey);
+    const edgeStartedAt = Date.now();
     const cached = await readAvailabilityCache_(cacheKey);
+    timing.edge = Math.max(0, Date.now() - edgeStartedAt);
     if (cached) {
       let payload;
       try { payload = await cached.json(); } catch (_) {}
       if (payload && payload.ok === true && Array.isArray(payload.dates) &&
           Array.isArray(payload.classes) && payload.classes.length && isVerifiedUpstreamAvailabilityAge_(payload)) {
-        return await deliverReservationAvailability_(payload, env, routeKey, 'HIT', startedAt);
+        return finish(await deliverReservationAvailability_(payload, env, routeKey, 'HIT', startedAt));
       }
     }
-    const payload = await loadReservationAvailabilityPayload_(env, routeKey, false, startedAt + RESERVATION_READ_BUDGET_MS);
+    const payload = await loadReservationAvailabilityPayload_(env, routeKey, false, startedAt + RESERVATION_READ_BUDGET_MS, timing);
     // Verified snapshots are also reusable under the daily policy. Cache TTL and
     // proofs retain their original expiry, including when GAS returns fallback.
     const write = storeAvailabilityCache_(cacheKey, reservationAvailabilityResponse_(payload, payload.generatedAt));
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(write);
     else await write;
-    return await deliverReservationAvailability_(payload, env, routeKey, payload.fallback ? 'FALLBACK' : 'MISS', startedAt);
+    return finish(await deliverReservationAvailability_(payload, env, routeKey, payload.fallback ? 'FALLBACK' : 'MISS', startedAt));
   } catch (error) {
-    return availabilityDeliveryResponse_(reservationError_(error), 'ERROR', startedAt);
+    return finish(availabilityDeliveryResponse_(reservationError_(error), 'ERROR', startedAt));
   }
 }
 
@@ -458,20 +485,29 @@ function mapGasRejection_(message) {
 }
 
 async function handleReservationSession_(request, env) {
+  const startedAt = Date.now();
+  let lineMs = 0;
+  function finish(response) {
+    response.headers.set('server-timing', 'line_verify;dur=' + lineMs + ', session;dur=' + Math.max(0, Date.now() - startedAt));
+    return response;
+  }
   try {
     const body = await readJsonBody_(request);
     const routeKey = requireRoute_(body.route);
     // Do this while the person fills the form, with one bounded upstream call.
-    const identity = await verifyLineIdToken_(body.idToken, env, { attempts: 1, timeoutMs: 6000 });
+    const lineStartedAt = Date.now();
+    let identity;
+    try { identity = await verifyLineIdToken_(body.idToken, env, { attempts: 1, timeoutMs: 6000 }); }
+    finally { lineMs = Math.max(0, Date.now() - lineStartedAt); }
     const expiresAt = Math.min(Number(identity.exp) * 1000, Date.now() + 15 * 60000);
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error('invalid_line_identity');
     const payload = JSON.stringify({ route: routeKey, aud: String(env.LINE_LOGIN_CHANNEL_ID),
       sub: identity.sub, name: safeSingleLine_(identity.name, 80), expiresAt });
     const signature = await crypto.subtle.sign('HMAC', await reservationPolicyKey_(env),
       new TextEncoder().encode('prospect-reservation-session-v1\n' + payload));
-    return json_({ ok: true, identityProof: { payload,
-      signature: Array.from(new Uint8Array(signature), b => b.toString(16).padStart(2, '0')).join('') }, expiresAt }, 200);
-  } catch (error) { return reservationError_(error); }
+    return finish(json_({ ok: true, identityProof: { payload,
+      signature: Array.from(new Uint8Array(signature), b => b.toString(16).padStart(2, '0')).join('') }, expiresAt }, 200));
+  } catch (error) { return finish(reservationError_(error)); }
 }
 
 async function readReservationIdentity_(env, routeKey, body) {
@@ -968,7 +1004,7 @@ async function verifyLineIdToken_(idToken, env, options) {
  * Public availability reads have one wall-clock budget, including body reads.
  * Retry only a completed transient failure; never hedge a slow GAS execution.
  */
-async function forwardAvailabilityToGas_(env, routeKey, body, deadlineAt) {
+async function forwardAvailabilityToGas_(env, routeKey, body, deadlineAt, timing) {
   if (!env.GAS_WEBHOOK_URL || !env.GAS_FORWARD_KEY) throw new Error('gas_not_configured');
   const forwardUrl = new URL(env.GAS_WEBHOOK_URL);
   forwardUrl.searchParams.set('key', env.GAS_FORWARD_KEY);
@@ -980,6 +1016,8 @@ async function forwardAvailabilityToGas_(env, routeKey, body, deadlineAt) {
     if (remaining <= 0) throw new Error('gas_timeout');
     const controller = new AbortController();
     const timer = setTimeout(function () { controller.abort(); }, remaining);
+    const attemptStartedAt = Date.now();
+    if (timing) timing.gasAttempts += 1;
     try {
       const response = await fetch(forwardUrl.toString(), {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -1003,7 +1041,10 @@ async function forwardAvailabilityToGas_(env, routeKey, body, deadlineAt) {
       if (error && error.upstreamStatus && !isRetryableGasGatewayStatus_(error.upstreamStatus)) throw error;
       lastError = error;
       if (!isTransientAvailabilityError_(error) && !(error instanceof TypeError)) throw error;
-    } finally { clearTimeout(timer); }
+    } finally {
+      clearTimeout(timer);
+      if (timing) timing.gas += Math.max(0, Date.now() - attemptStartedAt);
+    }
     if (attempt === 0 && deadline - Date.now() > 300) await delay_(250);
     else break;
   }
@@ -1322,6 +1363,7 @@ function buildReservationHtml_(liffId) {
 </main>
 <script>
   const CONFIG=${config};
+  markPhase('js-start');
   const statusBox=document.getElementById('status');
   const lineStatus=document.getElementById('lineStatus');
   const availabilityStatus=document.getElementById('availabilityStatus');
@@ -1363,13 +1405,30 @@ function buildReservationHtml_(liffId) {
     return routeFromUrl(current);
   }
   function markPhase(name){
-    if(window.performance&&typeof performance.mark==='function')performance.mark('reservation:'+name);
+    try{if(window.performance&&typeof performance.mark==='function')performance.mark('reservation:'+name)}catch(_){}
   }
+  function measurePhase(name,start,end){
+    try{if(typeof performance.measure==='function')performance.measure('reservation:'+name,{start:start===0?0:'reservation:'+start,end:'reservation:'+end})}catch(_){}
+  }
+  function markOnce(name){
+    try{if(performance.getEntriesByName('reservation:'+name).length)return}catch(_){}
+    markPhase(name);measurePhase('navigation-to-'+name,0,name);
+  }
+  let apiSequence=0;const apiTimings=[];
+  window.prospectReservationPerformance=()=>{
+    const nav=performance.getEntriesByType('navigation')[0];
+    const sdk=performance.getEntriesByType('resource').find(e=>e.name==='https://static.line-scdn.net/liff/edge/2/sdk.js');
+    return {version:'startup-audit-1',navigation:nav?{ttfbMs:nav.responseStart,htmlReceiveMs:nav.responseEnd-nav.responseStart,domContentLoadedMs:nav.domContentLoadedEventEnd}:null,
+      sdk:sdk?{durationMs:sdk.duration}:null,
+      marks:performance.getEntriesByType('mark').filter(e=>e.name.startsWith('reservation:')).map(e=>({name:e.name,ms:e.startTime})),
+      measures:performance.getEntriesByType('measure').filter(e=>e.name.startsWith('reservation:')).map(e=>({name:e.name,ms:e.duration})),apis:apiTimings.slice()};
+  };
   function setStatus(message,type){statusBox.textContent=message;statusBox.className='status '+type}
   function setPhase(element,message,type){element.textContent=message;element.className='status '+type}
   function withTimeout(promise,ms,label){let timer;const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(label||'timeout')),ms)});return Promise.race([promise,timeout]).finally(()=>clearTimeout(timer))}
   function updateSubmitState(){
     submitButton.disabled=submitting||completed||!lineReady||!availabilityReady;
+    if(!submitting&&!completed&&lineReady&&availabilityReady)markOnce('submit-enabled');
     if(submitting||completed)return;
     if(!lineReady)submitButton.textContent='LINE接続を確認しています…';
     else if(!availabilityReady)submitButton.textContent='日程・クラスを確認しています…';
@@ -1401,10 +1460,12 @@ function buildReservationHtml_(liffId) {
     const delayed=setTimeout(()=>setPhase(lineStatus,'LINEの応答が遅れています。接続でき次第、自動で続行します。解消しない場合はLINEの体験予約から開き直してください。','error'),12000);
     lineTask=(async()=>{
       try{
-        await loadLiffSdk();markPhase('sdk-ready');
+        markPhase('sdk-start');
+        await loadLiffSdk();markPhase('sdk-ready');measurePhase('sdk-wait','sdk-start','sdk-ready');
         // A timed-out Promise does not cancel liff.init. Keep exactly one pending init.
+        markPhase('liff-init-start');
         await liff.init({liffId:CONFIG.liffId});
-        markPhase('line-initialized');
+        markPhase('line-initialized');measurePhase('liff-init','liff-init-start','line-initialized');
         const resolvedRoute=getRoute();
         if(resolvedRoute&&resolvedRoute!==routeKey){routeKey=resolvedRoute;prepareForm();loadAvailability()}
         if(!routeKey)throw new Error('INVALID_ROUTE');
@@ -1413,7 +1474,7 @@ function buildReservationHtml_(liffId) {
         idToken=liff.getIDToken();
         if(!idToken)throw new Error('MISSING_ID_TOKEN');
         // Receipt delivery is independent of durable reservation acceptance.
-        lineReady=true;lineStatus.classList.add('hidden');markPhase('line-ready');
+        lineReady=true;lineStatus.classList.add('hidden');markPhase('line-ready');measurePhase('navigation-to-line-ready',0,'line-ready');
         void prepareIdentity().catch(()=>{});
       }catch(error){
         lineReady=false;
@@ -1430,7 +1491,8 @@ function buildReservationHtml_(liffId) {
     document.getElementById('venueName').textContent=CONFIG.routes[routeKey].venue;
     if(!childrenArea.children.length)addChild();
     if(preparedRoute!==routeKey){preparedRoute=routeKey;restoreDraft()}
-    form.classList.remove('hidden');markPhase('form-visible');
+    form.classList.remove('hidden');markOnce('form-visible');
+    if(typeof requestAnimationFrame==='function')requestAnimationFrame(()=>requestAnimationFrame(()=>markOnce('form-paint-opportunity')));
   }
   function prepareIdentity(){
     if(identityProof&&Date.now()<identityExpiresAt-30000)return Promise.resolve(identityProof);
@@ -1439,7 +1501,7 @@ function buildReservationHtml_(liffId) {
     identityTask=postJson('/api/reservations/session',{route:sessionRoute,idToken:liff.getIDToken()||idToken},{attempts:1,timeoutMs:8000}).then(data=>{
       if(sessionRoute!==routeKey)throw new Error('INVALID_ROUTE');
       if(!data.identityProof||!Number.isFinite(data.expiresAt))throw new Error('invalid_line_identity');
-      identityProof=data.identityProof;identityExpiresAt=data.expiresAt;markPhase('identity-ready');return identityProof;
+      identityProof=data.identityProof;identityExpiresAt=data.expiresAt;markPhase('identity-ready');measurePhase('navigation-to-identity-ready',0,'identity-ready');return identityProof;
     }).finally(()=>{identityTask=null});
     return identityTask;
   }
@@ -1478,7 +1540,8 @@ function buildReservationHtml_(liffId) {
         }else if(data.fallback){
           setPhase(availabilityStatus,'保存済みの日程・受付状況を表示しています。','loading');
         }else availabilityStatus.classList.add('hidden');
-        markPhase('availability-ready');
+        markPhase('availability-ready');measurePhase('navigation-to-availability-ready',0,'availability-ready');
+        if(availabilityReady)markOnce('choices-enabled');
       }catch(_){
         if(routeKey!==requestedRoute)return;
         setPhase(availabilityStatus,'日程・クラスを取得できませんでした。入力は残っています。通信を確認して再取得してください。','error');
@@ -1513,8 +1576,12 @@ function buildReservationHtml_(liffId) {
     const settings=options||{};const attempts=Math.max(1,Number(settings.attempts||1));const timeoutMs=Math.max(5000,Number(settings.timeoutMs||30000));let lastError=new Error('request_failed');
     for(let attempt=1;attempt<=attempts;attempt+=1){
       const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeoutMs);
+      const span='api-'+(++apiSequence);const began=typeof performance.now==='function'?performance.now():0;
+      let status=0,cache=null,serverTiming=null;
+      markPhase(span+'-start');
       try{
         const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload),signal:controller.signal});
+        status=response.status;cache=response.headers.get('x-prospect-cache');serverTiming=response.headers.get('server-timing');
         const data=await response.json().catch(()=>({ok:false,message:'invalid_response'}));
         if(response.ok&&data.ok)return data;
         const error=new Error(data.message||'request_failed');error.httpStatus=response.status;lastError=error;
@@ -1523,7 +1590,10 @@ function buildReservationHtml_(liffId) {
         lastError=error&&error.name==='AbortError'?new Error('request_timeout'):error;
         const status=Number(lastError&&lastError.httpStatus||0);
         if(status&&!retryableStatus(status))throw lastError;
-      }finally{clearTimeout(timer)}
+      }finally{clearTimeout(timer);markPhase(span+'-end');measurePhase(span,span+'-start',span+'-end');
+        const api=path==='/api/reservations/availability'?'availability':path==='/api/reservations/session'?'session':'reservation';
+        apiTimings.push({api,attempt,status,cache,serverTiming,ms:typeof performance.now==='function'?performance.now()-began:null});if(apiTimings.length>30)apiTimings.shift();
+      }
       if(attempt<attempts){if(typeof settings.onRetry==='function')settings.onRetry(attempt,attempts,lastError);await wait(600*attempt)}
     }
     throw lastError;
