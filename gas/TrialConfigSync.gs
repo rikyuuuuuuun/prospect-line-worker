@@ -100,3 +100,13 @@ function installProspectTrialConfigSync() {
     ScriptApp.newTrigger('watchProspectTrialConfig').timeBased().everyMinutes(15).create();
   return syncProspectTrialConfig();
 }
+
+function previewProspectTrialConfig() {
+  const started=Date.now(); const data=buildProspectTrialConfig_(readProspectTrialSources_(),Date.now());
+  console.log(JSON.stringify({event:"trial_config_preview",totalMs:Date.now()-started,bytes:Utilities.newBlob(JSON.stringify(data)).getBytes().length,routes:Object.keys(data.byRoute).map(function(route){const c=data.byRoute[route];return {route:route,dateCount:c.dates.length,first:c.dates[0],last:c.dates[c.dates.length-1],classes:c.classes,fixedClass:c.fixedClass};})}));
+}
+function prepareProspectTrialConfigProduction() {
+  PropertiesService.getScriptProperties().setProperty("PROSPECT_TRIAL_CONFIG_URL","https://prospect-line-webhook.line-harness-trampoline.workers.dev/internal/trial-config");
+  console.log(JSON.stringify(syncProspectTrialConfig()));
+}
+function verifyProspectTrialConfigWatchdog() { console.log(JSON.stringify(watchProspectTrialConfig())); }
