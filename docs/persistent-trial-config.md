@@ -4,7 +4,7 @@
 
 監査元: `prospect-line-worker` c01a93c935eb4eee0f7135dbcac6d5876014c2c1、`prospect-gas` e80a13ea8c8165f2efbf07ad983ab4cdf6576eb6。
 両リポジトリの全ファイルを取得・確認。GAS catalog は line-reception を除外している。
-別途、体験管理シートに紐づく Apps Script のコードをブラウザで読み取り、既存のカレンダー解析・クラス解析・保存処理を確認した。編集・デプロイ・実行はしていない。
+別途、体験管理シートに紐づく Apps Script のコードをブラウザで読み取り、既存のカレンダー解析・クラス解析・保存処理を確認した。既存コードは変更せず、TrialConfigSync.gsを追加して初回同期を実行済み。既存予約Webアプリのデプロイは変更していない。
 
 ```
 LINE → URL/HTML（GAS通信なし、未計測）→ inline JS
@@ -61,11 +61,11 @@ watchdogはDriveの更新日時2件だけを確認し、不変ならSheets読み
 変更時のSheets操作: カレンダーopenById 1、getSheets 1、月タブごと最大120行×14列のgetDisplayValues 1（最大12回）、既存クラス関数のマスターopenById 1/getSheetByName 1/getDisplayValues 1。1会場ごとの再読取ではない。getValue/getValues/setValue/setValuesはこの新同期モジュールで0。既存予約保存・運営同期の書込みには触らない。
 日程はカレンダーにある各月を保存するため、月替わりだけを理由にSheetsへ再取得しない。ただし未作成の将来日程を自動生成はしない。
 
-## リリース条件（本番未反映）
+## リリース手順
 
 1. 同期モジュールを対象GASへ追加し、既存秘密値をコピーせず同プロジェクトの `LINE_WEBHOOK_FORWARD_KEY` を利用。`PROSPECT_TRIAL_CONFIG_URL` に対象Workerの `/internal/trial-config` URLを設定する。
 2. Drive metadata読取など追加権限が必要なら、管理者の認可を完了する。対象の2編集トリガー+15分watchdog以外の既存トリガーを変更しない。
-3. 初回は `TRIAL_CONFIG_BRIDGE_ONLY=true` を明示した橋渡しdeployを行う。このモードだけPOSTを保存した旧 `legacy-availability.js` に接続し、push/RPC/GET設定読取を先行利用できる。同期・全30会場のGET内容比較を完了した後、フラグを除去して本設定をdeployする。通常モードに自動GASフォールバックはない。**空ストアのまま本PRをmainへmergeしない**。本リポジトリはmainが本番自動deploy対象。橋渡し期間中は日次cronを止めるため、初期同期・切替を同じ作業時間内に行い、失敗なら旧バージョンへ戻す。
+3. 初回は `TRIAL_CONFIG_BRIDGE_ONLY=true` を明示した橋渡しdeployを行う。このモードだけPOSTを保存した旧 `legacy-availability.js` に接続し、push/RPC/GET設定読取を先行利用できる。同期・全30会場のGET内容比較を完了した後、フラグを明示的にfalseにして本設定をdeployする。通常モードに自動GASフォールバックはない。**空ストアのまま本PRをmainへmergeしない**。本リポジトリはmainが本番自動deploy対象。橋渡し期間中は日次cronを止めるため、初期同期・切替を同じ作業時間内に行い、失敗なら旧バージョンへ戻す。
 4. `syncProspectTrialConfig` は明示的な再送/復旧用。成功後 `installProspectTrialConfigSync` でwatchdog等を導入し、手編集および運営同期の両方が反映されることを確認する。
 5. 実機LINEでA/B/C/Dと単一/3クラス、当日/翌月末/過去日、受付停止/待ち、紹介者、控え、保存、重複送信を確認。予約データを無断でテスト登録しない。
 6. 問題があれば旧Workerバージョンへ戻す。旧DOデータと予約Outboxを削除していないため切り戻せる。
@@ -84,3 +84,12 @@ Worker `Server-Timing: config, gas, worker` と匿名タイミングログ。GAS
 | GAS障害 | 約6039ms後エラー、選択不可 | 44.1 / 922.4ms |
 
 枠の初期表示は変更前7.9ms→変更後5.8ms（MISS条件、ローカル）。もともと先行表示済みであり、この差を高速化効果とは主張しない。効果は期限切れ時のGAS依存をなくすこと。実機LINEの3秒/5秒達成、実ネットワークHTML/SDK速度、GAS実行時間、Cloudflare実コールドスタートは未計測。
+
+## 本番切替前の確認（2026-09-20 JST）
+
+- 初回同期成功: 30会場。Sheets 3632ms / 加工554ms / 同期全体9372ms（利用者のリクエスト外）。
+- 新GET設定APIの全30会場: 200、61〜159ms、Server-Timing gas=0。
+- 旧POST応答と、新GET応答のdates/classes/fixedClassを全30会場でdeepEqual確認。受付状態・時刻を含め一致。
+- 本番GASへ2つの編集トリガーと15分watchdogを設置。
+- 最終切替はTRIAL_CONFIG_BRIDGE_ONLY=falseの明示設定。元のbridge版へ戻す場合はtrueを再deploy。
+- 実機LINEの起動から送信までのE2E時間と実予約登録は別途未実測。

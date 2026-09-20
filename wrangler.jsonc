@@ -3,7 +3,7 @@
   "name": "prospect-line-webhook",
   "main": "src/worker.js",
   "compatibility_date": "2026-08-12",
-  "vars": { "TRIAL_CONFIG_BRIDGE_ONLY": "true" },
+  "vars": { "TRIAL_CONFIG_BRIDGE_ONLY": "false" },
   "triggers": {
     "crons": []
   },
