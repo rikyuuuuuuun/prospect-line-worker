@@ -2,7 +2,7 @@ import core, { ReservationOutbox, deliverTrialConfig_ } from './index.js';
 import legacyAvailability from './legacy-availability.js';
 import { AvailabilitySnapshot } from './availability-snapshot.js';
 import { configDigest, verifyConfigPush, normalizeTrialConfig, currentTrialWindow, TRIAL_CONFIG_MAX_BYTES } from './trial-config.js';
-export { ReservationOutbox, AvailabilitySnapshot };
+export { ReservationOutbox, AvailabilitySnapshot, configPushKeys };
 const RESERVATION_ROUTES = Object.freeze([
   'a/saitama-shibakawa', 'a/sugishita', 'a/mizuhodai', 'a/kamekubo',
   'a/ageo-fujimi', 'a/ageo-shibakawa', 'a/kasumigaseki-nishi',
@@ -55,7 +55,7 @@ async function deliver(request,env,ctx) {
 async function push(request,env,ctx) {
   try {
     const body=await readBounded(request,TRIAL_CONFIG_MAX_BYTES);
-    if(!await verifyConfigPush(request,body,env.GAS_FORWARD_KEY))return json({ok:false,message:'unauthorized'},401);
+    if(!await verifyConfigPushAny(request,body,configPushKeys(env)))return json({ok:false,message:'unauthorized'},401);
     const bundle=normalizeTrialConfig(JSON.parse(body),RESERVATION_ROUTES);
     const digest=await configDigest(JSON.stringify(bundle.byRoute));
     const object=store(ctx);if(!object)throw Error('trial_config_unavailable');
@@ -67,6 +67,31 @@ async function push(request,env,ctx) {
     return json({ok:false,message},status);
   }
 }
+// Dedicated push key first. GAS_FORWARD_KEY stays accepted until the legacy switch is set,
+// so the Worker secret and the GAS property can be rotated without a failed-sync window.
+function configPushKeys(env) {
+  const keys=[env.TRIAL_CONFIG_PUSH_KEY];
+  if(env.TRIAL_CONFIG_PUSH_LEGACY_DISABLED!=='true')keys.push(env.GAS_FORWARD_KEY);
+  return [...new Set(keys.filter(k=>typeof k==='string'&&k))];
+}
+async function verifyConfigPushAny(request,body,keys) {
+  for(const key of keys) if(await verifyConfigPush(request,body,key)) return true;
+  return false;
+}
+// Liveness of the GAS synchronizer. meta.revision advances on every accepted push,
+// including unchanged heartbeats, so its age measures "last successful sync".
+const TRIAL_CONFIG_DEFAULT_STALE_MS=12*3600000;
+async function trialConfigHealth(env,ctx) {
+  try {
+    const meta=await store(ctx)?.getTrialConfigMeta();
+    if(!meta)return json({ok:false,state:'empty'},503);
+    const limit=Number(env.TRIAL_CONFIG_STALE_MS)>0?Number(env.TRIAL_CONFIG_STALE_MS):TRIAL_CONFIG_DEFAULT_STALE_MS;
+    const now=Date.now(); const syncAgeMs=Math.max(0,now-Number(meta.revision)); const contentAgeMs=Math.max(0,now-Number(meta.updatedAt));
+    const stale=!Number.isFinite(syncAgeMs)||syncAgeMs>limit;
+    return json({ok:!stale,state:stale?'stale':'fresh',lastSyncAt:new Date(Number(meta.revision)).toISOString(),
+      syncAgeMinutes:Math.floor(syncAgeMs/60000),contentAgeMinutes:Math.floor(contentAgeMs/60000),staleAfterMinutes:Math.floor(limit/60000)},stale?503:200);
+  } catch(_) { return json({ok:false,state:'unavailable'},503); }
+}
 export default {
   async fetch(request,env,ctx) {
     const path=new URL(request.url).pathname.toLowerCase().replace(/^\/+|\/+$/g,'');
@@ -77,6 +102,7 @@ export default {
     if ((request.method==='GET' && path==='trial-config') ||
         (request.method==='POST' && path==='api/reservations/availability')) return deliver(request,env,ctx);
     if (request.method==='POST' && path==='internal/trial-config')return push(request,env,ctx);
+    if(request.method==='GET' && path==='health/trial-config')return trialConfigHealth(env,ctx);
     if(request.method==='GET' && path==='health/availability-snapshot'){
       const route=new URL(request.url).searchParams.get('route');
       if(!ROUTE_SET.has(route))return json({ok:false,message:'invalid_route'},400);

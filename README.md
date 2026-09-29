@@ -21,6 +21,19 @@ Keep secrets in Cloudflare. Do not commit secret values to GitHub.
 
 The current Worker source also supports the legacy `LINE_CHANNEL_SECRET` fallback for `a/saitama-shibakawa`.
 
+Optional hardening bindings (all backward compatible; unset = current behaviour):
+
+- `TRIAL_CONFIG_PUSH_KEY` — dedicated HMAC key for `POST /internal/trial-config`. Set the same value as GAS script property `PROSPECT_TRIAL_CONFIG_PUSH_KEY`. While `TRIAL_CONFIG_PUSH_LEGACY_DISABLED` is not `true`, pushes signed with `GAS_FORWARD_KEY` are still accepted.
+- `RESERVATION_PROOF_KEY` — dedicated HMAC key for availability/session proofs. New proofs are signed with it; proofs signed with `GAS_FORWARD_KEY` stay valid (max 24h) until `RESERVATION_PROOF_LEGACY_DISABLED=true`.
+- `HEALTH_PROBE_TOKEN` — when set, `POST /health/reservation-storage` (which writes a diagnostic record) requires `Authorization: Bearer <token>`. `GET` stays public.
+- `TRIAL_CONFIG_STALE_MS` — staleness threshold for `GET /health/trial-config` (default 12h).
+
+## Monitoring endpoints
+
+- `GET /health` — Worker build (`2026-09-29-audit-hardening` after this release).
+- `GET /health/trial-config` — 200 `fresh` / 503 `stale`/`empty`. Based on the last accepted GAS push; GAS pushes a heartbeat at least every 6h, so 503 means the GAS synchronizer is broken, not merely that nobody edited the sheets. Point an external uptime monitor at this URL.
+- `GET /health/gas` — upstream GAS build check, cached per isolate for 60s so public calls cannot fan out into GAS executions.
+
 ## GitHub / Cloudflare deployment model
 
 1. Make code changes on a branch.

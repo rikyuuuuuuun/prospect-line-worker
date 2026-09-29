@@ -61,8 +61,8 @@ const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 // 活動申込は全会場共通URLで使います。GAS転送時だけ既存の有効ルートを内部利用します。
 const ACTIVITY_GAS_ROUTE = 'a/saitama-shibakawa';
 const ACTIVITY_LIFF_ID = '2011040394-O4z7w36C';
-const WORKER_BUILD = '2026-09-20-persistent-trial-config';
-const WORKER_RELEASE = '2026-09-20-persistent-trial-config';
+const WORKER_BUILD = '2026-09-29-audit-hardening';
+const WORKER_RELEASE = '2026-09-29-audit-hardening';
 const RESERVATION_READ_BUDGET_MS = 8000;
 const EXPECTED_GAS_BUILD = '2026-08-13-single-slot-auto1';
 // Submit proofs live for 24h. Persistent source config has no TTL; its revision
@@ -101,6 +101,12 @@ export default {
     }
 
     if (['GET', 'POST'].includes(request.method) && path === 'health/reservation-storage') {
+      // Starting a probe writes to Durable Object storage. Once HEALTH_PROBE_TOKEN is set,
+      // POST requires it; GET (read-only status) stays public for uptime monitors.
+      if (request.method === 'POST' && env.HEALTH_PROBE_TOKEN &&
+          !constantTimeEqual_('Bearer ' + env.HEALTH_PROBE_TOKEN, request.headers.get('authorization') || '')) {
+        return json_({ ok: false, message: 'unauthorized' }, 401);
+      }
       try {
         const probe = ctx.exports.ReservationOutbox.getByName('diagnostic-v1', { locationHint: 'apac' });
         const result = request.method === 'POST' ? await probe.startProbe() : await probe.probeStatus();
@@ -316,10 +322,29 @@ function availabilityDeliveryResponse_(response, cacheState, startedAt) {
   return new Response(response.body, { status: response.status, headers });
 }
 
+// Proof/session HMAC key. RESERVATION_PROOF_KEY (optional) separates this purpose from
+// GAS forwarding. During rotation proofs signed with GAS_FORWARD_KEY stay verifiable
+// (max 24h) until RESERVATION_PROOF_LEGACY_DISABLED=true.
+function reservationProofSecrets_(env) {
+  const keys = [env.RESERVATION_PROOF_KEY];
+  if (env.RESERVATION_PROOF_LEGACY_DISABLED !== 'true') keys.push(env.GAS_FORWARD_KEY);
+  return [...new Set(keys.filter(function (key) { return typeof key === 'string' && key; }))];
+}
+
 async function reservationPolicyKey_(env) {
-  if (!env.GAS_FORWARD_KEY) throw new Error('gas_not_configured');
-  return crypto.subtle.importKey('raw', new TextEncoder().encode(env.GAS_FORWARD_KEY),
+  const secret = reservationProofSecrets_(env)[0];
+  if (!secret) throw new Error('gas_not_configured');
+  return crypto.subtle.importKey('raw', new TextEncoder().encode(secret),
     { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+
+async function verifyReservationHmac_(env, signature, bytes) {
+  for (const secret of reservationProofSecrets_(env)) {
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    if (await crypto.subtle.verify('HMAC', key, signature, bytes)) return true;
+  }
+  return false;
 }
 
 async function signReservationPolicy_(env, routeKey, availability) {
@@ -356,7 +381,7 @@ async function readReservationPolicy_(env, routeKey, proof) {
       typeof proof.signature !== 'string' || !/^[0-9a-f]{64}$/.test(proof.signature)) throw new Error('invalid_availability_policy');
   const signature = Uint8Array.from(proof.signature.match(/../g), byte => parseInt(byte, 16));
   const bytes = new TextEncoder().encode(RESERVATION_POLICY_PURPOSE + '\n' + proof.payload);
-  if (!await crypto.subtle.verify('HMAC', await reservationPolicyKey_(env), signature, bytes)) throw new Error('invalid_availability_policy');
+  if (!await verifyReservationHmac_(env, signature, bytes)) throw new Error('invalid_availability_policy');
   let policy;
   try { policy = JSON.parse(proof.payload); } catch (_) { throw new Error('invalid_availability_policy'); }
   if (!policy || policy.route !== routeKey || !Array.isArray(policy.dates) || !Array.isArray(policy.classes)) throw new Error('invalid_availability_policy');
@@ -442,7 +467,22 @@ function isTransientAvailabilityError_(error) {
  * CloudflareとGASの接続だけを確認する安全な診断口。
  * URL・共通キー・個人情報は返しません。
  */
+// Public diagnostics must not amplify into GAS executions: at most one upstream check
+// per isolate per minute. Only plain data is cached (never a promise or stream), because
+// Workers must not share I/O objects across requests.
+const GAS_HEALTH_CACHE_MS = 60000;
+let gasHealthCache_ = null;
 async function handleGasHealth_(env) {
+  if (!gasHealthCache_ || gasHealthCache_.expiresAt <= Date.now()) {
+    const response = await handleGasHealthUncached_(env);
+    gasHealthCache_ = { expiresAt: Date.now() + GAS_HEALTH_CACHE_MS, status: response.status, body: await response.text() };
+  }
+  return new Response(gasHealthCache_.body, { status: gasHealthCache_.status, headers: {
+    'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff', 'x-prospect-health-cache': 'isolate-60s' } });
+}
+
+async function handleGasHealthUncached_(env) {
   try {
     const result = await forwardToGas_(
       env,
@@ -517,7 +557,7 @@ async function readReservationIdentity_(env, routeKey, body) {
   if (!proof || typeof proof.payload !== 'string' || proof.payload.length > 2000 ||
       typeof proof.signature !== 'string' || !/^[0-9a-f]{64}$/.test(proof.signature)) throw new Error('invalid_line_identity');
   const signature = Uint8Array.from(proof.signature.match(/../g), byte => parseInt(byte, 16));
-  if (!await crypto.subtle.verify('HMAC', await reservationPolicyKey_(env), signature,
+  if (!await verifyReservationHmac_(env, signature,
     new TextEncoder().encode('prospect-reservation-session-v1\n' + proof.payload))) throw new Error('invalid_line_identity');
   let identity;
   try { identity = JSON.parse(proof.payload); } catch (_) { throw new Error('invalid_line_identity'); }

@@ -43,7 +43,14 @@ function buildProspectTrialConfig_(sources, revision) {
   });
   return { schemaVersion: 1, revision: revision, byRoute: byRoute };
 }
+// Push at least this often even when nothing changed, so the Worker's
+// GET /health/trial-config can tell "no edits" apart from "sync is broken".
+var PROSPECT_TRIAL_CONFIG_HEARTBEAT_MS = 6 * 60 * 60 * 1000;
 function syncProspectTrialConfig_(force) {
+  if (!force) {
+    const lastPushAt = Number(PropertiesService.getScriptProperties().getProperty('TRIAL_CONFIG_LAST_PUSH_AT') || 0);
+    if (Date.now() - lastPushAt > PROSPECT_TRIAL_CONFIG_HEARTBEAT_MS) force = 'publish';
+  }
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return { ok: false, deferred: true }; // watchdog retries; never block reservation writes
   const started = Date.now();
@@ -66,7 +73,8 @@ function syncProspectTrialConfig_(force) {
     const processMs = Date.now() - processAt;
     const url = props.getProperty('PROSPECT_TRIAL_CONFIG_URL') || '';
     if (!/^https:\/\/[^/]+\/internal\/trial-config$/.test(url)) throw Error('trial_config_url_not_configured');
-    const secret = props.getProperty('LINE_WEBHOOK_FORWARD_KEY');
+    // Dedicated push key when configured (matches Worker TRIAL_CONFIG_PUSH_KEY); legacy key otherwise.
+    const secret = props.getProperty('PROSPECT_TRIAL_CONFIG_PUSH_KEY') || props.getProperty('LINE_WEBHOOK_FORWARD_KEY');
     if (!secret) throw Error('trial_config_signing_key_missing');
     const timestamp = String(Date.now());
     const signature = Utilities.computeHmacSha256Signature('prospect-trial-config-push-v1\n' + timestamp + '\n' + body, secret, Utilities.Charset.UTF_8)
@@ -76,7 +84,7 @@ function syncProspectTrialConfig_(force) {
     const result = JSON.parse(response.getContentText());
     if (response.getResponseCode() !== 200 || result.ok !== true) throw Error('trial_config_push_failed_' + response.getResponseCode());
     // Only acknowledge AFTER durable storage. Any failure leaves the old snapshot and causes retry.
-    props.setProperties({ TRIAL_CONFIG_SOURCE_VERSIONS: versions, TRIAL_CONFIG_SOURCE_HASH: fingerprint, TRIAL_CONFIG_REVISION: String(revision) }, false);
+    props.setProperties({ TRIAL_CONFIG_SOURCE_VERSIONS: versions, TRIAL_CONFIG_SOURCE_HASH: fingerprint, TRIAL_CONFIG_REVISION: String(revision), TRIAL_CONFIG_LAST_PUSH_AT: String(Date.now()) }, false);
     console.log(JSON.stringify({event:'trial_config_sync',sheetsMs:sheetsMs,processMs:processMs,totalMs:Date.now()-started,routeCount:Object.keys(sources.classes).length}));
     return { ok: true, revision: revision, sheetsMs: sheetsMs, processMs: processMs, totalMs: Date.now()-started };
   } finally { lock.releaseLock(); }

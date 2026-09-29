@@ -61,3 +61,26 @@ it('Ageo Fujimi remains one slot and Muneoka Daini retains all three numbered cl
  const ageo=await(await get('a/ageo-fujimi')).json();expect(ageo.classes.map(c=>c.value)).toEqual(['前半']);expect(ageo.fixedClass).toBe('前半');
  const muneoka=await(await get('c/muneoka-daini')).json();expect(muneoka.classes.map(c=>c.value)).toEqual(['①クラス','②クラス','③クラス']);expect(muneoka.classes.map(c=>c.status)).toEqual(['open','waitlist','closed']);
 });
+
+it('health/trial-config reports fresh after a push and stale when the last sync is too old',async()=>{
+ const empty=await exports.default.fetch('https://fixture.invalid/health/trial-config');expect(empty.status).toBe(503);expect((await empty.json()).state).toBe('empty');
+ expect((await push(bundle(Date.now()-60000))).status).toBe(200);
+ const fresh=await exports.default.fetch('https://fixture.invalid/health/trial-config');const body=await fresh.json();
+ expect(fresh.status).toBe(200);expect(body.state).toBe('fresh');expect(body.staleAfterMinutes).toBe(720);expect(JSON.stringify(body)).not.toMatch(/dates|classes|digest/);
+ await reset();
+ expect((await push(bundle(Date.now()-13*3600000),'test-only-key',Date.now())).status).toBe(200);
+ const stale=await exports.default.fetch('https://fixture.invalid/health/trial-config');expect(stale.status).toBe(503);expect((await stale.json()).state).toBe('stale');
+ expect(network).not.toHaveBeenCalled();
+});
+it('config push accepts the legacy key only until the legacy switch is disabled',async()=>{
+ const {configPushKeys}=await import('../src/worker.js');
+ expect(configPushKeys({GAS_FORWARD_KEY:'legacy'})).toEqual(['legacy']);
+ expect(configPushKeys({GAS_FORWARD_KEY:'legacy',TRIAL_CONFIG_PUSH_KEY:'new'})).toEqual(['new','legacy']);
+ expect(configPushKeys({GAS_FORWARD_KEY:'legacy',TRIAL_CONFIG_PUSH_KEY:'new',TRIAL_CONFIG_PUSH_LEGACY_DISABLED:'true'})).toEqual(['new']);
+});
+it('public GAS health probe is cached so repeated calls do not fan out to GAS',async()=>{
+ const first=await exports.default.fetch('https://fixture.invalid/health/gas');const calls=network.mock.calls.length;
+ expect(calls).toBeGreaterThan(0);
+ for(let i=0;i<5;i++){const r=await exports.default.fetch('https://fixture.invalid/health/gas');expect(r.status).toBe(first.status);expect(r.headers.get('x-prospect-health-cache')).toBe('isolate-60s');}
+ expect(network.mock.calls.length).toBe(calls);
+});
