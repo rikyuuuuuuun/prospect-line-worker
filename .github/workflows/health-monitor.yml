@@ -1,0 +1,26 @@
+name: Production health monitor
+# A failed scheduled run makes GitHub email the repository owner, so a stalled
+# GAS trial-config sync or a broken deployment is noticed without another service.
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASE_URL: https://prospect-line-webhook.line-harness-trampoline.workers.dev
+    steps:
+      - name: Worker is up
+        run: |
+          body=$(curl -fsS --retry 3 --retry-delay 20 --max-time 20 "$BASE_URL/health")
+          echo "$body" | jq -e '.ok == true' > /dev/null
+          echo "build: $(echo "$body" | jq -r '.build')" >> "$GITHUB_STEP_SUMMARY"
+      - name: GAS trial-config sync is fresh
+        run: |
+          # 503 means the last GAS sync is older than 12 hours (or no config is stored).
+          body=$(curl -sS --retry 3 --retry-delay 20 --max-time 20 "$BASE_URL/health/trial-config")
+          echo "$body" | jq -c '{state, syncAgeMinutes, staleAfterMinutes}' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$body" | jq -e '.ok == true and .state == "fresh"' > /dev/null
