@@ -11,6 +11,12 @@ export class AvailabilitySnapshot extends DurableObject {
     return meta && config ? { ...meta, config } : null;
   }
 
+  // Metadata only (revision = last accepted push, updatedAt = last content change). No config body.
+  async getTrialConfigMeta() {
+    const meta = await this.ctx.storage.get('trial:meta');
+    return meta ? { revision: meta.revision, updatedAt: meta.updatedAt, digest: meta.digest } : null;
+  }
+
   async putTrialConfig(bundle, digest) {
     return this.ctx.storage.transaction(async txn => {
       const previous = await txn.get('trial:meta');

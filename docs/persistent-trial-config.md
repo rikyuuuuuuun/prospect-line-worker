@@ -43,7 +43,7 @@ HTML → inline JS → 子ども入力
 ## GAS同期と変更経路
 
 追加ファイル: `gas/TrialConfigSync.gs`。既存LINE受信プロジェクトへ追加するモジュールであり、受信コード全文の置換ではない。
-確認したプロジェクト: `1zWch6bz8H6L1WJhb-Tbt5xfUTyzJnf49shac_WM8SFcWKR0M-E9Uwe9Z`。ブラウザで見たHEADと現在公開されているWebアプリのバージョン一致までは未確認。
+確認したプロジェクト: LINE受信GASプロジェクト（スクリプトIDは公開repoに記載しない。管理者の非公開メモを参照）。ブラウザで見たHEADと現在公開されているWebアプリのバージョン一致までは未確認。
 
 既存関数 `readProspectCalendarAvailabilityValues_` / `readProspectClassAvailabilityAllLive_` / `selectProspectClassAvailability_` / `resolveProspectReservationFixedClass_` を再利用。会場別名、○の日付、同曜日隣接列、上尾富士見1コマ、宗岡第二3クラスを独自に再定義しない。
 
