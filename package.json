@@ -14,7 +14,7 @@
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.1.8",
     "happy-dom": "20.14.5",
-    "vitest": "4.1.8",
+    "vitest": "5.0.2",
     "wrangler": "^4.0.0"
   }
 }
