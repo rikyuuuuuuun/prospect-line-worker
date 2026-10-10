@@ -1,3 +1,4 @@
+import { captureAInbox } from './assistant.js';
 /**
  * 体操&トランポリンクラブ LINE Webhook Gateway
  * 体験予約LIFF + イベント・大会申込LIFF
@@ -191,6 +192,14 @@ async function handleLineWebhook_(request, env, rawRoute, ctx) {
       }
       if (!events.length && envelope.events.length) return json_({ ok: true }, 200);
       if (events.length !== envelope.events.length) forwardBody = JSON.stringify({ ...envelope, events });
+    }
+    // Optional A-only assistant mirror; existing GAS is still the primary receipt path.
+    // Never hold or reject a LINE webhook because the assistant is unavailable.
+    if (env.ASSISTANT_ENABLED === 'true' && routeKey.startsWith('a/') && ctx?.waitUntil) {
+      ctx.waitUntil(captureAInbox(ctx, env, routeKey,
+        JSON.parse(forwardBody).events || []).catch(() => {
+        console.error(JSON.stringify({ event: 'assistant_capture_failed', route: routeKey }));
+      }));
     }
     const result = await forwardToGas_(env, routeKey, forwardBody);
     if (result && result.ok === false) {
