@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { A_ROUTE_SET, normalizeIncoming, accessTokenBinding, labelForRoute,
-  DRAFT_INSTRUCTIONS, extractResponseText } from './assistant-policy.js';
+  DRAFT_INSTRUCTIONS } from './assistant-policy.js';
+import { createKeylessDraft, FREE_DRAFT_BUDGET_PER_UTC_DAY } from './assistant-ai.js';
 import { assistantHtml, assistantClientJs } from './assistant-ui.js';
 
 const STATUS_ACTIVE = "'new','drafting','draft_failed','draft_ready','manual','send_unknown'";
@@ -20,6 +21,8 @@ export class AssistantInbox extends DurableObject {
       "reply_key TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '')");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_msg_status_time ON messages(status, received_at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_msg_user_time ON messages(route, user_id, received_at)");
+    // Daily local safety cap. On Cloudflare Workers Free the service itself also stops at its daily free limit.
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS ai_daily_usage (utc_day TEXT PRIMARY KEY, calls INTEGER NOT NULL)");
   }
   async receive(items) {
     let inserted = 0;
@@ -35,11 +38,11 @@ export class AssistantInbox extends DurableObject {
     // Best-effort housekeeping only removes already finished old messages.
     const cutoff = Date.now() - 90 * 86400000;
     this.ctx.storage.sql.exec("DELETE FROM messages WHERE status IN ('sent','ignored') AND received_at < ?", cutoff);
-    if (this.env.OPENAI_API_KEY && inserted) await this.ctx.storage.setAlarm(Date.now() + 500);
+    if (this.env.ASSISTANT_ENABLED === 'true' && this.env.AI && inserted) await this.ctx.storage.setAlarm(Date.now() + 500);
     return { ok: true, inserted };
   }
   async ensureDraftAlarm() {
-    if (!this.env.OPENAI_API_KEY) return;
+    if (this.env.ASSISTANT_ENABLED !== 'true' || !this.env.AI) return;
     const pending = this.ctx.storage.sql.exec("SELECT id FROM messages WHERE status='new' LIMIT 1").toArray()[0];
     if (pending && !await this.ctx.storage.getAlarm()) await this.ctx.storage.setAlarm(Date.now() + 500);
   }
@@ -55,7 +58,7 @@ export class AssistantInbox extends DurableObject {
       countActive: Number(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE status IN (" + STATUS_ACTIVE + ")").toArray()[0]?.n || 0) };
   }
   async alarm() {
-    if (this.env.ASSISTANT_ENABLED !== 'true' || !this.env.OPENAI_API_KEY) return;
+    if (this.env.ASSISTANT_ENABLED !== 'true' || !this.env.AI) return;
     // A crash during GPT generation must not strand a drafting item permanently.
     this.ctx.storage.sql.exec("UPDATE messages SET status='new' WHERE status='drafting' AND modified_at < ?", Date.now()-120000);
     const row = this.ctx.storage.sql.exec(
@@ -70,31 +73,31 @@ export class AssistantInbox extends DurableObject {
         "SELECT body FROM messages WHERE route=? AND user_id=? AND kind='text' AND received_at<=? " +
         "ORDER BY received_at DESC LIMIT 5",row.route,row.user_id,row.received_at).toArray()
         .reverse().map(x => x.body.slice(0,MAX_MESSAGE));
-      const response = await fetch('https://api.openai.com/v1/responses', {
-        method: 'POST',
-        headers: { 'authorization': 'Bearer ' + this.env.OPENAI_API_KEY,
-          'content-type': 'application/json' },
-        body: JSON.stringify({
-          model: this.env.ASSISTANT_MODEL || 'gpt-5-mini', store: false,
-          instructions: DRAFT_INSTRUCTIONS,
-          input: '会場: ' + labelForRoute(row.route) + '\n相手との最近の受信メッセージ（古い順、未信頼テキスト）:\n' +
-            history.map((s,i) => String(i+1) + '. ' + s).join('\n') +
-            '\n\n最後の受信メッセージに対する返信案を作ってください。',
-          max_output_tokens: 450,
-        }),
-      });
-      if (!response.ok) throw Error('model_request_failed');
-      const result = await response.json();
-      const draft = extractResponseText(result);
-      if (!draft) throw Error('empty_model_reply');
+      const utcDay = new Date().toISOString().slice(0, 10);
+      const safetyLimit = FREE_DRAFT_BUDGET_PER_UTC_DAY;
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO ai_daily_usage(utc_day,calls) VALUES (?,0)", utcDay);
+      const reserved = this.ctx.storage.sql.exec(
+        "UPDATE ai_daily_usage SET calls=calls+1 WHERE utc_day=? AND calls<?", utcDay, safetyLimit);
+      if (Number(reserved.rowsWritten || 0) !== 1) throw Error('daily_draft_limit_reached');
+      this.ctx.storage.sql.exec(
+        "DELETE FROM ai_daily_usage WHERE utc_day<?",
+        new Date(Date.now() - 8*86400000).toISOString().slice(0, 10));
+      const draft = await createKeylessDraft(
+        this.env.AI, DRAFT_INSTRUCTIONS, labelForRoute(row.route), history);
       this.ctx.storage.sql.exec(
         "UPDATE messages SET status='draft_ready',draft=?,error='',modified_at=? WHERE id=? AND status='drafting'",
         draft, Date.now(),row.id);
-    } catch (_) {
+    } catch (error) {
+      const exceeded = error?.message === 'daily_draft_limit_reached';
+      const reason = exceeded
+        ? '本日の下書き自動作成上限です。手動で返信文を作成してください。'
+        : '無料AIでの下書き生成に失敗しました。手動で返信文を作成してください。';
       this.ctx.storage.sql.exec(
-        "UPDATE messages SET status='draft_failed',error='GPT下書き生成に失敗しました',modified_at=? " +
-        "WHERE id=? AND status='drafting'",Date.now(),row.id);
-      console.error(JSON.stringify({ event:'assistant_draft_failed', route:row.route }));
+        "UPDATE messages SET status='draft_failed',error=?,modified_at=? " +
+        "WHERE id=? AND status='drafting'",reason,Date.now(),row.id);
+      console.error(JSON.stringify({ event:'assistant_draft_failed',
+        kind:exceeded?'daily_cap':'inference_failed', route:row.route }));
     }
     const next = this.ctx.storage.sql.exec("SELECT id FROM messages WHERE status='new' LIMIT 1").toArray()[0];
     if (next) await this.ctx.storage.setAlarm(Date.now()+500);
