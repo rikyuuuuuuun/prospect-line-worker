@@ -1,8 +1,9 @@
 import core, { ReservationOutbox, deliverTrialConfig_ } from './index.js';
+import { AssistantInbox, assistantRequest } from './assistant.js';
 import legacyAvailability from './legacy-availability.js';
 import { AvailabilitySnapshot } from './availability-snapshot.js';
 import { configDigest, verifyConfigPush, normalizeTrialConfig, currentTrialWindow, TRIAL_CONFIG_MAX_BYTES } from './trial-config.js';
-export { ReservationOutbox, AvailabilitySnapshot, configPushKeys };
+export { ReservationOutbox, AvailabilitySnapshot, AssistantInbox, configPushKeys };
 const RESERVATION_ROUTES = Object.freeze([
   'a/saitama-shibakawa', 'a/sugishita', 'a/mizuhodai', 'a/kamekubo',
   'a/ageo-fujimi', 'a/ageo-shibakawa', 'a/kasumigaseki-nishi',
@@ -95,6 +96,7 @@ async function trialConfigHealth(env,ctx) {
 export default {
   async fetch(request,env,ctx) {
     const path=new URL(request.url).pathname.toLowerCase().replace(/^\/+|\/+$/g,'');
+    if (path === 'assistant' || path.startsWith('assistant/')) return assistantRequest(request, env, ctx);
     // Explicit one-time migration mode only. Never an automatic miss/error fallback.
     // Lets the signed push endpoint seed storage before production forms switch.
     if (env.TRIAL_CONFIG_BRIDGE_ONLY === 'true' && request.method==='POST' &&
