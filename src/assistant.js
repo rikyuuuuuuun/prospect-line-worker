@@ -118,6 +118,11 @@ export class AssistantInbox extends DurableObject {
     const row = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE id=?",id).toArray()[0];
     if (!row || row.status !== 'draft_ready' || !text.trim() || text.length > MAX_MESSAGE)
       return {ok:false,code:'not_ready'};
+    // Reject a stale draft if the parent sent another message meanwhile.
+    const newer = this.ctx.storage.sql.exec(
+      "SELECT id FROM messages WHERE route=? AND user_id=? AND id<>? AND kind='text' " +
+      "AND received_at >= ? LIMIT 1",row.route,row.user_id,row.id,row.received_at).toArray()[0];
+    if (newer) return {ok:false,code:'newer_message_requires_review'};
     const retryKey = crypto.randomUUID();
     this.ctx.storage.sql.exec(
       "UPDATE messages SET status='sending',draft=?,reply_key=?,modified_at=? WHERE id=? AND status='draft_ready'",
