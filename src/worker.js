@@ -1,4 +1,4 @@
-import core, { ReservationOutbox, deliverTrialConfig_ } from './index.js';
+import core, { ReservationOutbox, deliverTrialConfig_, consumeLineWebhookBatch_ } from './index.js';
 import { AssistantInbox, assistantRequest } from './assistant.js';
 import legacyAvailability from './legacy-availability.js';
 import { AvailabilitySnapshot } from './availability-snapshot.js';
@@ -15,6 +15,7 @@ const RESERVATION_ROUTES = Object.freeze([
   'd/nakano', 'd/ebinuma', 'd/komatsu', 'd/shima',
 ]);
 const ROUTE_SET = new Set(RESERVATION_ROUTES);
+const LINE_WEBHOOK_QUEUE_NAME = 'prospect-line-webhook-events';
 
 function store(ctx) {
   return ctx?.exports?.AvailabilitySnapshot?.getByName('trial-config-v1', { locationHint: 'apac' });
@@ -112,5 +113,10 @@ export default {
       catch(_){return json({ok:false,state:'unavailable'},503);}
     }
     return core.fetch(request,env,ctx);
+  },
+  async queue(batch,env,ctx) {
+    if (batch.queue===LINE_WEBHOOK_QUEUE_NAME) return consumeLineWebhookBatch_(batch,env,ctx);
+    console.error(JSON.stringify({event:'unknown_queue',queue:batch.queue}));
+    batch.retryAll();
   },
 };

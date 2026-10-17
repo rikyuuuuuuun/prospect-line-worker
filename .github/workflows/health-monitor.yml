@@ -24,3 +24,9 @@ jobs:
           body=$(curl -sS --retry 3 --retry-delay 20 --max-time 20 "$BASE_URL/health/trial-config")
           echo "$body" | jq -c '{state, syncAgeMinutes, staleAfterMinutes}' | tee -a "$GITHUB_STEP_SUMMARY"
           echo "$body" | jq -e '.ok == true and .state == "fresh"' > /dev/null
+      - name: GAS intake is reachable
+        run: |
+          # LINE webhooks are queued and retried while GAS is down; this surfaces the outage.
+          body=$(curl -sS --retry 3 --retry-delay 20 --max-time 40 "$BASE_URL/health/gas")
+          echo "$body" | jq -c '{ok, gasBuild, authorization, activityCalendar}' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$body" | jq -e '.ok == true' > /dev/null

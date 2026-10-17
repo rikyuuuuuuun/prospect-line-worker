@@ -1,6 +1,7 @@
 import { env, exports } from 'cloudflare:workers';
-import { runInDurableObject, runDurableObjectAlarm, reset } from 'cloudflare:test';
+import { runInDurableObject, runDurableObjectAlarm, reset, createMessageBatch, createExecutionContext, getQueueResult } from 'cloudflare:test';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import worker from '../src/worker.js';
 let network;
 beforeEach(()=>{network=vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('External traffic disabled'));});
 afterEach(async()=>{vi.restoreAllMocks();await reset();});
@@ -92,9 +93,14 @@ it('ordinary chat in a batch still reaches GAS; an unknown or different sender r
   const receipt={type:'message',source:{userId},message:{type:'text',text:'【体験予約を送信しました】\nsynthetic\n受付番号：FORM-'+data.requestId}};
   const chat={type:'message',source:{userId},message:{type:'text',text:'ordinary synthetic chat'}};
   network.mockImplementation(async()=>Response.json({ok:true}));
+  const queued=vi.spyOn(env.LINE_WEBHOOK_QUEUE,'send').mockResolvedValue(undefined);
   expect((await webhook([receipt,chat])).status).toBe(200);
-  expect(JSON.parse(network.mock.calls[0][1].body).events).toEqual([chat]);
   const another={...receipt,source:{userId:'U'+'2'.repeat(32)}};
   expect((await webhook([another])).status).toBe(200);
+  expect(network).not.toHaveBeenCalled();
+  const batch=createMessageBatch('prospect-line-webhook-events',queued.mock.calls.map((call,i)=>({id:'m'+i,timestamp:new Date(),attempts:1,body:call[0]})));
+  const ctx=createExecutionContext();await worker.queue(batch,env,ctx);
+  expect((await getQueueResult(batch,ctx)).explicitAcks).toEqual(['m0','m1']);
+  expect(JSON.parse(network.mock.calls[0][1].body).events).toEqual([chat]);
   expect(JSON.parse(network.mock.calls[1][1].body).events).toEqual([another]);
 });
