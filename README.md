@@ -28,9 +28,13 @@ Optional hardening bindings (all backward compatible; unset = current behaviour)
 - `HEALTH_PROBE_TOKEN` — when set, `POST /health/reservation-storage` (which writes a diagnostic record) requires `Authorization: Bearer <token>`. `GET` stays public.
 - `TRIAL_CONFIG_STALE_MS` — staleness threshold for `GET /health/trial-config` (default 12h).
 
+## LINE webhook delivery
+
+Verified LINE webhooks are acknowledged after a durable enqueue and forwarded to GAS by a Cloudflare Queues consumer with retries and a dead-letter queue. See [LINE webhook queue](docs/line-webhook-queue.md).
+
 ## Monitoring endpoints
 
-- `GET /health` — Worker build (`2026-09-29-audit-hardening` after this release).
+- `GET /health` — Worker build (`2026-10-18-line-webhook-queue` after this release).
 - `GET /health/trial-config` — 200 `fresh` / 503 `stale`/`empty`. Based on the last accepted GAS push; GAS pushes a heartbeat at least every 6h, so 503 means the GAS synchronizer is broken, not merely that nobody edited the sheets. Point an external uptime monitor at this URL.
 - `GET /health/gas` — upstream GAS build check, cached per isolate for 60s so public calls cannot fan out into GAS executions.
 

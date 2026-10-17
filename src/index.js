@@ -61,8 +61,8 @@ const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 // 活動申込は全会場共通URLで使います。GAS転送時だけ既存の有効ルートを内部利用します。
 const ACTIVITY_GAS_ROUTE = 'a/saitama-shibakawa';
 const ACTIVITY_LIFF_ID = '2011040394-O4z7w36C';
-const WORKER_BUILD = '2026-09-29-audit-hardening';
-const WORKER_RELEASE = '2026-09-29-audit-hardening';
+const WORKER_BUILD = '2026-10-18-line-webhook-queue';
+const WORKER_RELEASE = '2026-10-18-line-webhook-queue';
 const RESERVATION_READ_BUDGET_MS = 8000;
 const EXPECTED_GAS_BUILD = '2026-08-13-single-slot-auto1';
 // Submit proofs live for 24h. Persistent source config has no TTL; its revision
@@ -161,6 +161,14 @@ function route_(secretBinding, team, venue, publicVenue, fixedClass) {
   });
 }
 
+// LINE waits only 2 seconds for a webhook response, while a GAS intake takes 2-6 seconds
+// under its script lock. Answer LINE after a durable enqueue and forward from the queue
+// consumer; GAS deduplicates by webhookEventId, so at-least-once delivery is safe.
+// LINE_WEBHOOK_MODE=sync (or a failed enqueue) keeps the original synchronous path.
+const LINE_WEBHOOK_QUEUE_MAX_BYTES = 120000;
+const LINE_WEBHOOK_MESSAGE_VERSION = 1;
+const LINE_WEBHOOK_MAX_RETRY_DELAY_SECONDS = 300;
+
 async function handleLineWebhook_(request, env, rawRoute, ctx) {
   const routeKey = normalizeRoute_(rawRoute);
   const route = ROUTES[routeKey];
@@ -178,29 +186,22 @@ async function handleLineWebhook_(request, env, rawRoute, ctx) {
   const valid = await verifyLineSignature_(body, signature, channelSecret);
   if (!valid) return json_({ ok: false, message: 'invalid_signature' }, 401);
 
+  if (env.LINE_WEBHOOK_MODE !== 'sync' && env.LINE_WEBHOOK_QUEUE &&
+      new TextEncoder().encode(body).byteLength <= LINE_WEBHOOK_QUEUE_MAX_BYTES) {
+    try {
+      JSON.parse(body);
+      await env.LINE_WEBHOOK_QUEUE.send({
+        v: LINE_WEBHOOK_MESSAGE_VERSION, route: routeKey, body: body, receivedAt: Date.now(),
+      }, { contentType: 'json' });
+      return json_({ ok: true }, 200);
+    } catch (error) {
+      console.error(JSON.stringify({ event: 'line_webhook_enqueue_failed', route: routeKey }));
+    }
+  }
+
   try {
-    // The new receipt may arrive before the outbox has synced to GAS. Suppress
-    // only receipts whose sender/route/request ID already has durable acceptance.
-    // All ordinary chat and legacy events keep the existing forwarding path.
-    const envelope = JSON.parse(body);
-    let forwardBody = body;
-    if (Array.isArray(envelope.events)) {
-      const events = [];
-      for (const event of envelope.events) {
-        if (!await isAcceptedReservationReceipt_(ctx, routeKey, event)) events.push(event);
-      }
-      if (!events.length && envelope.events.length) return json_({ ok: true }, 200);
-      if (events.length !== envelope.events.length) forwardBody = JSON.stringify({ ...envelope, events });
-    }
-    // Optional A-only assistant mirror; existing GAS is still the primary receipt path.
-    // Never hold or reject a LINE webhook because the assistant is unavailable.
-    if (env.ASSISTANT_ENABLED === 'true' && routeKey.startsWith('a/') && ctx?.waitUntil) {
-      ctx.waitUntil(import('./assistant.js').then(({ captureAInbox }) =>
-        captureAInbox(ctx, env, routeKey, JSON.parse(forwardBody).events || [])
-      ).catch(() => {
-        console.error(JSON.stringify({ event: 'assistant_capture_failed', route: routeKey }));
-      }));
-    }
+    const forwardBody = await prepareLineForward_(ctx, env, routeKey, body);
+    if (forwardBody === null) return json_({ ok: true }, 200);
     const result = await forwardToGas_(env, routeKey, forwardBody);
     if (result && result.ok === false) {
       return json_({ ok: false, message: 'gas_rejected' }, 502);
@@ -208,6 +209,62 @@ async function handleLineWebhook_(request, env, rawRoute, ctx) {
     return json_({ ok: true }, 200);
   } catch (error) {
     return json_({ ok: false, message: 'gas_unreachable' }, 502);
+  }
+}
+
+// Returns the body to forward to GAS, or null when nothing is left to forward.
+async function prepareLineForward_(ctx, env, routeKey, body) {
+  // The new receipt may arrive before the outbox has synced to GAS. Suppress
+  // only receipts whose sender/route/request ID already has durable acceptance.
+  // All ordinary chat and legacy events keep the existing forwarding path.
+  const envelope = JSON.parse(body);
+  let forwardBody = body;
+  if (Array.isArray(envelope.events)) {
+    const events = [];
+    for (const event of envelope.events) {
+      if (!await isAcceptedReservationReceipt_(ctx, routeKey, event)) events.push(event);
+    }
+    if (!events.length && envelope.events.length) return null;
+    if (events.length !== envelope.events.length) forwardBody = JSON.stringify({ ...envelope, events });
+  }
+  // Optional A-only assistant mirror; existing GAS is still the primary receipt path.
+  // Never hold or reject a LINE webhook because the assistant is unavailable.
+  if (env.ASSISTANT_ENABLED === 'true' && routeKey.startsWith('a/') && ctx?.waitUntil) {
+    ctx.waitUntil(import('./assistant.js').then(({ captureAInbox }) =>
+      captureAInbox(ctx, env, routeKey, JSON.parse(forwardBody).events || [])
+    ).catch(() => {
+      console.error(JSON.stringify({ event: 'assistant_capture_failed', route: routeKey }));
+    }));
+  }
+  return forwardBody;
+}
+
+// Queue consumer. One message is one verified LINE envelope. Messages are forwarded one
+// at a time (GAS serialises intake behind a script lock anyway); a failure retries only
+// that message with exponential backoff, then moves to the dead-letter queue.
+export async function consumeLineWebhookBatch_(batch, env, ctx) {
+  for (const message of batch.messages) {
+    const item = message.body;
+    if (!item || item.v !== LINE_WEBHOOK_MESSAGE_VERSION || !ROUTES[item.route] || typeof item.body !== 'string') {
+      console.error(JSON.stringify({ event: 'line_webhook_message_invalid', id: message.id }));
+      message.ack();
+      continue;
+    }
+    try {
+      const forwardBody = await prepareLineForward_(ctx, env, item.route, item.body);
+      if (forwardBody !== null) {
+        const result = await forwardToGas_(env, item.route, forwardBody, 1);
+        if (result && result.ok === false) throw new Error('gas_rejected');
+      }
+      message.ack();
+      console.log(JSON.stringify({ event: 'line_webhook_forwarded', route: item.route,
+        attempts: message.attempts, queueMs: Math.max(0, Date.now() - Number(item.receivedAt || Date.now())) }));
+    } catch (error) {
+      const delaySeconds = Math.min(LINE_WEBHOOK_MAX_RETRY_DELAY_SECONDS, 15 * 2 ** Math.max(0, message.attempts - 1));
+      console.warn(JSON.stringify({ event: 'line_webhook_forward_retry', route: item.route,
+        attempts: message.attempts, delaySeconds, message: safeSingleLine_(error && error.message, 80) }));
+      message.retry({ delaySeconds });
+    }
   }
 }
 

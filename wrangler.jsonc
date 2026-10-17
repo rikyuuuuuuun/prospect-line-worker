@@ -3,9 +3,24 @@
   "name": "prospect-line-webhook",
   "main": "src/worker.js",
   "compatibility_date": "2026-08-12",
-  "vars": { "TRIAL_CONFIG_BRIDGE_ONLY": "false" },
+  "vars": { "TRIAL_CONFIG_BRIDGE_ONLY": "false", "LINE_WEBHOOK_MODE": "queue" },
   "triggers": {
     "crons": []
+  },
+  "queues": {
+    "producers": [
+      { "binding": "LINE_WEBHOOK_QUEUE", "queue": "prospect-line-webhook-events" }
+    ],
+    "consumers": [
+      {
+        "queue": "prospect-line-webhook-events",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 100,
+        "max_concurrency": 1,
+        "dead_letter_queue": "prospect-line-webhook-events-dlq"
+      }
+    ]
   },
   "exports": {
     "ReservationOutbox": {
