@@ -13,6 +13,7 @@ const RESERVATION_ROUTES = Object.freeze([
   'c/gyoda-nishi', 'c/asaka-dai10', 'c/tokorozawa-minami', 'c/kurohama-minami',
   'd/obukuro-higashi', 'd/shimooshi', 'd/izumi', 'd/yagisaki',
   'd/nakano', 'd/ebinuma', 'd/komatsu', 'd/shima',
+  'e/tsurugashima-fuji',
 ]);
 const ROUTE_SET = new Set(RESERVATION_ROUTES);
 const LINE_WEBHOOK_QUEUE_NAME = 'prospect-line-webhook-events';
@@ -58,7 +59,17 @@ async function push(request,env,ctx) {
   try {
     const body=await readBounded(request,TRIAL_CONFIG_MAX_BYTES);
     if(!await verifyConfigPushAny(request,body,configPushKeys(env)))return json({ok:false,message:'unauthorized'},401);
-    const bundle=normalizeTrialConfig(JSON.parse(body),RESERVATION_ROUTES);
+    const input=JSON.parse(body);
+    // The old GAS publishes 30 venues until its separate deployment is approved.
+    // Keep those updates valid while closing E explicitly if its source is absent.
+    // All existing venues and any supplied E configuration still pass full validation.
+    if(input?.byRoute && typeof input.byRoute==='object' && !Array.isArray(input.byRoute) &&
+        !Object.prototype.hasOwnProperty.call(input.byRoute,'e/tsurugashima-fuji')) {
+      input.byRoute['e/tsurugashima-fuji']={dates:[],classes:[
+        {value:'前半',status:'closed'}, {value:'後半',status:'closed'},
+      ],fixedClass:''};
+    }
+    const bundle=normalizeTrialConfig(input,RESERVATION_ROUTES);
     const digest=await configDigest(JSON.stringify(bundle.byRoute));
     const object=store(ctx);if(!object)throw Error('trial_config_unavailable');
     return json(await object.putTrialConfig(bundle,digest));

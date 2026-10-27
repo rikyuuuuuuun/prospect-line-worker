@@ -20,6 +20,28 @@ async function push(data, key='test-only-key', time=Date.now()){
  return exports.default.fetch('https://fixture.invalid/internal/trial-config',{method:'POST',headers:{'x-prospect-timestamp':timestamp,'x-prospect-signature':signature},body});
 }
 async function get(r=route){return exports.default.fetch('https://fixture.invalid/trial-config?route='+encodeURIComponent(r));}
+it('legacy 30-venue sync closes E, while a complete E sync enables its two configured classes',async()=>{
+ const eRoute='e/tsurugashima-fuji',t=Date.now()-1000;
+ expect((await push(bundle(t))).status).toBe(200);
+ const pending=await(await get(eRoute)).json();
+ expect(pending.dates).toEqual([]);
+ expect(pending.classes.map(c=>[c.value,c.status])).toEqual([['前半','closed'],['後半','closed']]);
+ const data=bundle(t+100);
+ data.byRoute[eRoute]={dates:[{value:'2026-11-09',label:'11月9日（月）'}],classes:[
+   {value:'前半',status:'open',time:'17:00〜17:50'},
+   {value:'後半',status:'open',time:'18:00〜18:50'},
+ ],fixedClass:''};
+ expect((await push(data)).status).toBe(200);
+ expect((await(await get(eRoute)).json()).classes.map(c=>[c.value,c.status,c.time])).toEqual([
+   ['前半','open','17:00〜17:50'],['後半','open','18:00〜18:50'],
+ ]);
+ // A rollback of GAS must close E instead of retaining its previous open settings.
+ expect((await push(bundle(t+200))).status).toBe(200);
+ expect((await(await get(eRoute)).json()).classes.every(c=>c.status==='closed')).toBe(true);
+ const incomplete=bundle(t+300);delete incomplete.byRoute['a/sugishita'];
+ expect((await push(incomplete)).status).toBe(400);
+ expect(network).not.toHaveBeenCalled();
+});
 it('all 30 venues use durable config and never fetch GAS/LINE, even after 30 days',async()=>{
  const data=bundle(Date.now()-30*86400000);expect((await push(data)).status).toBe(200);
  for(const r of routes){const response=await get(r),body=await response.json();expect(response.status).toBe(200);expect(body.dates).toEqual(data.byRoute[r].dates);expect(body.generatedAt).toBe(data.revision);expect(body.policyIssuedAt).toBeGreaterThan(data.revision);expect(body.availabilityProof.signature).toMatch(/^[a-f0-9]{64}$/);expect(response.headers.get('server-timing')).toContain('gas;dur=0');}

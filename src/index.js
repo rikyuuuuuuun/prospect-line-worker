@@ -55,6 +55,8 @@ const ROUTES = Object.freeze({
   'd/ebinuma': route_('LINE_SECRET_D_EBINUMA', 'D', '海老沼', '海老沼小学校体育館'),
   'd/komatsu': route_('LINE_SECRET_D_KOMATSU', 'D', '幸松', '幸松小学校体育館'),
   'd/shima': route_('LINE_SECRET_D_SHIMA', 'D', '島', '島小学校体育館'),
+
+  'e/tsurugashima-fuji': route_('LINE_SECRET_E_TSURUGASHIMA_FUJI', 'E', '鶴ヶ島藤', '鶴ヶ島藤体操＆トランポリンクラブ'),
 });
 
 const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
@@ -1849,6 +1851,9 @@ function buildReservationHtml_(liffId) {
 function buildActivityApplicationHtml_(liffId) {
   const publicRoutes = {};
   Object.keys(ROUTES).forEach(function (key) {
+    // E is being connected for trial reservations only. Activity registration
+    // still uses the existing A-D member integration and must keep its choices.
+    if (ROUTES[key].team === 'E') return;
     publicRoutes[key] = {
       team: ROUTES[key].team,
       venue: ROUTES[key].venue,
