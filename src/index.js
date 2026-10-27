@@ -76,6 +76,13 @@ const GRADES = Object.freeze([
   '年少', '年中', '年長', '1年生', '2年生', '3年生',
   '4年生', '5年生', '6年生',
 ]);
+const E_TEAM_GRADES = Object.freeze([
+  '年中', '年長', '1年生', '2年生', '3年生', '4年生', '5年生', '6年生',
+  '中学1年生', '中学2年生', '中学3年生',
+]);
+function reservationGrades_(routeKey) {
+  return routeKey === 'e/tsurugashima-fuji' ? E_TEAM_GRADES : GRADES;
+}
 const CLASSES = Object.freeze(['前半', '後半', '相談したい', '①クラス', '②クラス', '③クラス']);
 const CLASS_LABELS_BY_ROUTE = Object.freeze({
   'a/saitama-shibakawa': Object.freeze({
@@ -1040,7 +1047,7 @@ function validateReservation_(body, routeKey) {
     const kana = safeSingleLine_(child && child.kana, 50);
     const grade = safeSingleLine_(child && child.grade, 20);
     if (name.length < 2) throw new Error('invalid_child_name');
-    if (GRADES.indexOf(grade) === -1) throw new Error('invalid_grade');
+    if (reservationGrades_(routeKey).indexOf(grade) === -1) throw new Error('invalid_grade');
     return { name: name, kana: kana, grade: grade };
   });
   if (CLASSES.indexOf(className) === -1) throw new Error('invalid_class');
@@ -1412,7 +1419,7 @@ function html_(content) {
 function buildReservationHtml_(liffId) {
   const publicRoutes = {};
   Object.keys(ROUTES).forEach(function (key) {
-    publicRoutes[key] = { venue: ROUTES[key].publicVenue };
+    publicRoutes[key] = { venue: ROUTES[key].publicVenue, grades: reservationGrades_(key) };
   });
   const config = JSON.stringify({
     liffId: String(liffId), routes: publicRoutes, grades: GRADES, classes: CLASSES,
@@ -1598,7 +1605,10 @@ function buildReservationHtml_(liffId) {
   function prepareForm(){
     document.getElementById('venueName').textContent=CONFIG.routes[routeKey].venue;
     if(!childrenArea.children.length)addChild();
-    if(preparedRoute!==routeKey){preparedRoute=routeKey;restoreDraft()}
+    if(preparedRoute!==routeKey){
+      childrenArea.querySelectorAll('.child-grade').forEach(node=>{const selected=node.value;fillSelectNode(node,currentGrades(),'選択してください');if(currentGrades().includes(selected))node.value=selected});
+      preparedRoute=routeKey;restoreDraft();
+    }
     form.classList.remove('hidden');markOnce('form-visible');
     if(typeof requestAnimationFrame==='function')requestAnimationFrame(()=>requestAnimationFrame(()=>markOnce('form-paint-opportunity')));
   }
@@ -1627,7 +1637,7 @@ function buildReservationHtml_(liffId) {
       const draft=JSON.parse(raw);clearDraft();
       if(!Number.isFinite(draft.savedAt)||draft.savedAt>Date.now()||Date.now()-draft.savedAt>1800000||!Array.isArray(draft.children)||!draft.children.length||draft.children.length>MAX_CHILDREN)return;
       childrenArea.textContent='';
-      draft.children.forEach(child=>{addChild();const card=childrenArea.lastElementChild;card.querySelector('.child-name').value=String(child.name||'').slice(0,50);card.querySelector('.child-kana').value=String(child.kana||'').slice(0,50);card.querySelector('.child-grade').value=CONFIG.grades.includes(child.grade)?child.grade:''});
+      draft.children.forEach(child=>{addChild();const card=childrenArea.lastElementChild;card.querySelector('.child-name').value=String(child.name||'').slice(0,50);card.querySelector('.child-kana').value=String(child.kana||'').slice(0,50);card.querySelector('.child-grade').value=currentGrades().includes(child.grade)?child.grade:''});
       document.getElementById('referrer').value=String(draft.referrer||'').slice(0,80);document.getElementById('notes').value=String(draft.notes||'').slice(0,300);
     }catch(_){clearDraft()}
   }
@@ -1707,12 +1717,13 @@ function buildReservationHtml_(liffId) {
     throw lastError;
   }
   function refreshChildHeaders(){const cards=Array.from(childrenArea.querySelectorAll('.child-card'));cards.forEach((card,index)=>{card.querySelector('h3').textContent='お子さま '+(index+1);card.querySelector('.remove-child').classList.toggle('hidden',cards.length===1)});addChildButton.classList.toggle('hidden',cards.length>=MAX_CHILDREN)}
+  function currentGrades(){return CONFIG.routes[routeKey]?.grades||CONFIG.grades}
   function addChild(){
     if(childrenArea.children.length>=MAX_CHILDREN)return;
     const card=document.createElement('section');card.className='child-card';
     card.innerHTML='<div class="child-head"><h3></h3><button class="remove-child" type="button">削除</button></div><div class="field"><label>お子さまの氏名<span class="required">必須</span></label><input class="child-name" autocomplete="name" maxlength="50" required></div><div class="field"><label>ふりがな</label><input class="child-kana" maxlength="50"></div><div class="field"><label>学年<span class="required">必須</span></label><select class="child-grade" required></select></div>';
     const grade=card.querySelector('.child-grade');
-    fillSelectNode(grade,CONFIG.grades,'選択してください');
+    fillSelectNode(grade,currentGrades(),'選択してください');
     card.querySelector('.remove-child').addEventListener('click',()=>{card.remove();refreshChildHeaders()});
     childrenArea.appendChild(card);refreshChildHeaders();
   }
