@@ -18,6 +18,24 @@ test('E is present in the trial form without changing activity venue choices',as
   assert.equal(c.buildActivityApplicationHtml_('fixture').includes('"e/tsurugashima-fuji"'),false);
   assert.ok(c.buildActivityApplicationHtml_('fixture').includes('"b/tsurugashima-daiichi"'));
 });
+test('E accepts nursery middle-year through junior-high third-year and keeps other venues unchanged',async()=>{
+  const coreSource=(await readFile(new URL('../src/index.js',import.meta.url),'utf8'))
+    .replace(/^export \{ ReservationOutbox \} from .*;\r?$/m,'')
+    .replace(/export async function /g,'async function ')
+    .replace('export default {','globalThis.core = {');
+  const c=vm.createContext({console,TextEncoder});vm.runInContext(coreSource,c);
+  const input=grade=>({requestId:'grade-fixture-123456789',className:'前半',receptionType:'waitlist',experienceDate:'',children:[{name:'検証用',grade}]});
+  for(const grade of ['年中','年長','1年生','6年生','中学1年生','中学2年生','中学3年生'])
+    assert.equal(c.validateReservation_(input(grade),eRoute).children[0].grade,grade);
+  assert.throws(()=>c.validateReservation_(input('年少'),eRoute),/invalid_grade/);
+  assert.throws(()=>c.validateReservation_(input('中学3年生'),'a/sugishita'),/invalid_grade/);
+  assert.equal(c.validateReservation_(input('年少'),'a/sugishita').children[0].grade,'年少');
+  const config=JSON.parse(c.buildReservationHtml_('fixture').match(/const CONFIG=(\{.*\});/)[1]);
+  assert.equal(config.routes[eRoute].grades.length,11);
+  assert.equal(config.routes[eRoute].grades.includes('年少'),false);
+  assert.equal(config.routes[eRoute].grades.at(-1),'中学3年生');
+  assert.equal(config.routes['a/sugishita'].grades.at(-1),'6年生');
+});
 function setup() {
   let stored;
   const context=vm.createContext({console:{log(){},warn(){}},URL,Response,TextDecoder,Date,
