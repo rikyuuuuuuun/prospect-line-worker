@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:assistant": "wrangler dev --config wrangler.assistant-preview.jsonc --local",
     "deploy": "wrangler deploy",
     "check": "wrangler deploy --dry-run",
     "test": "npm run test:unit && npm run test:worker",

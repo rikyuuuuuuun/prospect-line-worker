@@ -1,81 +1,56 @@
-// Self-contained mobile approval page. No LINE text is injected as HTML.
-export const assistantHtml = [
-  '<!doctype html><html lang="ja"><head><meta charset="utf-8">',
-  '<meta name="viewport" content="width=device-width,initial-scale=1">',
-  '<title>Prospect｜Aチーム AI秘書</title>',
-  '<style>',
-  ':root{font-family:system-ui,-apple-system,sans-serif;color:#13243b;background:#f4f7fa}',
-  'body{margin:0;padding:0 12px 50px}main{max-width:900px;margin:auto}',
-  'header{padding:21px 4px 12px}h1{font-size:23px;margin:0 0 7px}',
-  'p{margin:5px 0;color:#5c6a7b;font-size:13px}',
-  '.panel,.item{border:1px solid #dbe3eb;background:#fff;border-radius:13px;padding:15px;margin:12px 0}',
-  '.row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}',
-  '.stack{display:flex;flex-direction:column;gap:7px}label{font-size:14px;font-weight:650}',
-  'input,textarea{box-sizing:border-box;width:100%;border:1px solid #b9c8d7;border-radius:9px;padding:11px;font:inherit}',
-  'textarea{min-height:110px;line-height:1.6;resize:vertical}',
-  'button{cursor:pointer;background:#195dcb;color:#fff;border:0;border-radius:9px;padding:10px 16px;font-weight:650}',
-  'button.secondary{background:#edf2f7;color:#203149}button.danger{background:#fff3ef;color:#a53322}',
-  'button:disabled{opacity:.5;cursor:not-allowed}button:focus-visible,input:focus-visible,textarea:focus-visible{outline:3px solid #9bbffd}',
-  '.small{font-size:12px;color:#718093}.body{white-space:pre-wrap;line-height:1.6;margin:12px 0}',
-  '.status{padding:4px 8px;border-radius:12px;background:#f0f4f9;font-size:12px}',
-  '.note{padding:10px;border-radius:8px;background:#fff8e7;color:#724b03;font-size:12px;margin:7px 0}',
-  '.hide{display:none}',
-  '</style></head><body><main>',
-  '<header><h1>Prospect｜Aチーム AI秘書</h1>',
-  '<p>LINE公式アカウントの受信と返信案。実際の送信は承認ボタンを押した時だけです。</p></header>',
-  '<section id="login" class="panel stack"><label for="token">管理者アクセストークン</label>',
-  '<input id="token" type="password" autocomplete="off" placeholder="管理者用トークンを入力">',
-  '<div class="row"><span class="small">トークンはブラウザに保存しません</span><button id="unlock">受信箱を開く</button></div></section>',
-  '<section id="inbox" class="hide"><div class="panel row"><strong id="summary">受信確認中</strong>',
-  '<button id="refresh" class="secondary">最新に更新</button></div><div id="alerts" role="status"></div>',
-  '<div id="messages"></div></section>',
-  '</main><script src="/assistant/app.js" defer></script></body></html>'
-].join('');
-
-export const assistantClientJs = [
-  '(function(){',
-  '"use strict";',
-  'var token="";',
-  'var $=function(id){return document.getElementById(id)};',
-  'var box=$("messages"),alerts=$("alerts");',
-  'var statusLabels={new:"下書き待ち",drafting:"GPT作成中",draft_failed:"生成エラー",draft_ready:"承認待ち",manual:"画像等・手動確認",sending:"送信処理中",sent:"送信済み",send_unknown:"送信成否未確定",ignored:"対応不要"};',
-  'var routeLabels={"a/saitama-shibakawa":"さいたま芝川","a/sugishita":"杉下","a/mizuhodai":"みずほ台","a/kamekubo":"亀久保","a/ageo-fujimi":"上尾富士見","a/ageo-shibakawa":"上尾芝川","a/kasumigaseki-nishi":"霞ヶ関西"};',
-  'function element(tag,text,cls){var e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;}',
-  'function notice(message){alerts.replaceChildren(element("div",message,"note"));}',
-  'async function api(path,data){var r=await fetch("/assistant/api/"+path,{method:data?"POST":"GET",headers:{"authorization":"Bearer "+token,"content-type":"application/json"},body:data?JSON.stringify(data):undefined,cache:"no-store"});var d=await r.json();if(!r.ok||d.ok===false)throw Error(d.code||"request_failed");return d;}',
-  'async function reload(){',
-  '  try{var data=await api("messages");$("summary").textContent="未対応 "+data.countActive+" 件";box.replaceChildren();',
-  '    if(!data.messages.length)box.append(element("div","受信メッセージはありません。","panel"));',
-  '    data.messages.forEach(function(m){box.appendChild(card(m));});',
-  '    alerts.replaceChildren();',
-  '  }catch(e){notice("取得に失敗しました: "+e.message);}}',
-  'function card(m){',
-  '  var c=element("article",undefined,"item");var head=element("div",undefined,"row");',
-  '  var venue=element("strong",routeLabels[m.route]||m.route);',
-  '  var when=new Date(m.received_at).toLocaleString("ja-JP",{timeZone:"Asia/Tokyo"});',
-  '  var meta=element("span",when+" / "+(statusLabels[m.status]||m.status),"small");head.append(venue,meta);c.append(head);',
-  '  c.append(element("p","ユーザーID末尾: "+m.user_id.slice(-6)+"　種別: "+m.kind,"small"));',
-  '  c.append(element("div",m.kind==="text"?m.body:"テキスト以外のメッセージです。LINE公式管理画面で確認してください。","body"));',
-  '  if(m.error)c.append(element("div",m.error,"note"));',
-  '  if(m.status==="send_unknown")c.append(element("div","二重送信防止のため、この画面から再送できません。LINE公式管理画面を確認してください。","note"));',
-  '  if(m.status==="draft_ready"){',
-  '    c.append(element("label","GPTの返信案（編集可）"));',
-  '    var area=element("textarea");area.value=m.draft||"";area.maxLength=2000;c.append(area);',
-  '    var buttons=element("div",undefined,"row");',
-  '    var send=element("button","確認してLINEに送信");',
-  '    send.addEventListener("click",async function(){if(!area.value.trim())return notice("返信文を入力してください");',
-  '      if(!confirm("この文面を実際のLINEに送信します。よろしいですか？"))return;',
-  '      send.disabled=true;try{await api("send",{id:m.id,text:area.value});await reload();}catch(e){notice("送信状態を確認してください: "+e.message);send.disabled=true;}});',
-  '    buttons.append(send);c.append(buttons);',
-  '  }',
-  '  if(m.status==="draft_failed"||m.status==="draft_ready"){var retry=element("button","下書き再生成","secondary");',
-  '    retry.addEventListener("click",async function(){retry.disabled=true;try{await api("redraft",{id:m.id});await reload();}catch(e){notice("再生成できません: "+e.message);retry.disabled=false;}});c.append(retry);}',
-  '  if(!["sent","ignored","sending","send_unknown"].includes(m.status)){var skip=element("button","返信不要として完了","danger");',
-  '    skip.addEventListener("click",async function(){if(!confirm("返信不要として記録しますか？"))return;skip.disabled=true;try{await api("dismiss",{id:m.id});await reload();}catch(e){notice(e.message);skip.disabled=false;}});c.append(skip);}',
-  '  return c;',
-  '}',
-  '$("unlock").addEventListener("click",async function(){token=$("token").value.trim();if(!token)return;',
-  '  $("token").value="";$("login").classList.add("hide");$("inbox").classList.remove("hide");await reload();});',
-  '$("refresh").addEventListener("click",reload);',
-  '})();'
-].join('\n');
+export const assistantHtml=`<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Prospect｜LINE返信アシスタント</title><style>
+:root{font-family:"Yu Gothic UI",Meiryo,sans-serif;color:#223b38;background:#f3f5f1;font-size:15px}*{box-sizing:border-box}body{margin:0}header{padding:24px 4vw;background:#173f38;color:white;display:flex;justify-content:space-between;gap:20px}header small{color:#b6d8ca}h1{font-size:24px;margin:6px 0}h2{font-size:21px;margin:6px 0 20px}h3{font-size:17px}main{max-width:1350px;margin:auto;padding:25px}nav{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}button{font:inherit;cursor:pointer;border:1px solid #b5c7bd;border-radius:8px;background:#fff;padding:9px 16px;color:#214b40}button.primary,nav button.selected{background:#235c4d;color:white;border-color:#235c4d}button:disabled{opacity:.5;cursor:wait}input,textarea,select{font:inherit;width:100%;border:1px solid #bdcbc1;border-radius:7px;padding:10px;background:#fff;color:#193c33}textarea{min-height:120px;resize:vertical;line-height:1.7}label{display:block;margin:12px 0 6px}label.check{display:flex;align-items:flex-start;gap:9px}input[type=checkbox]{width:auto;margin-top:5px}.card{padding:23px;background:white;border:1px solid #dae1d9;border-radius:12px;margin:14px 0}.grid{display:grid;grid-template-columns:1fr 1.25fr;gap:22px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:14px 0}.row input,.row select{width:auto;max-width:100%}.muted{color:#63796d;font-size:13px}.badge{display:inline-block;border-radius:20px;padding:4px 10px;background:#e7f1eb;font-size:12px;margin-right:7px}.warn{background:#fff6df;color:#765716;border:1px solid #efdfb1;border-radius:8px;padding:13px;line-height:1.7}.inquiry{background:#f1f5f1;border-radius:8px;padding:16px;white-space:pre-wrap;line-height:1.8}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}#notice{position:sticky;top:8px;z-index:4;padding:12px;background:#fff2ce;border-radius:9px;white-space:pre-wrap}#notice:empty{display:none}details{margin:12px 0}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.7}.empty{text-align:center;padding:60px;color:#657e6d}.privacy{font-size:13px;color:#5b7163}#login{max-width:650px;margin:45px auto}a{color:#1d6350}@media(max-width:800px){main{padding:15px}.grid{grid-template-columns:1fr}header{padding:20px}h1{font-size:20px}.card{padding:17px}}button:focus-visible,input:focus-visible,textarea:focus-visible{outline:3px solid #d4ab4c;outline-offset:2px}
+</style></head><body><header><div><small>PROSPECT / A TEAM</small><h1>LINE返信アシスタント</h1><small>いつもの返信を、過去の対応から。</small></div><div><span class="badge">手動送信</span><p><small>LINEへの自動送信機能はありません</small></p></div></header><main><div id="notice" role="status"></div><section id="login" class="card"><h2>管理者ログイン</h2><p class="muted">管理者トークンはこの画面のメモリ内だけで使用します。</p><label for="token">管理者トークン</label><input id="token" type="password" autocomplete="off"><div class="actions"><button id="connect" class="primary">受信箱を開く</button></div></section><section id="app" hidden><div class="row"><span id="summary" class="muted"></span><button id="refresh">更新</button><button id="logout">ログアウト</button></div><nav id="tabs" aria-label="管理メニュー"></nav><div id="content"></div></section></main><script src="/assistant/app.js" defer></script></body></html>`;
+function client(){
+  'use strict';let token='',state={},view='inbox',feedback=[];
+  const $=id=>document.getElementById(id),root=$('content');
+  const labels={new:'返信案待ち',drafting:'生成中',draft_ready:'確認待ち',copied:'コピー済み・送信未確認',draft_failed:'生成エラー',manual:'画像等・手動確認',sent:'旧送信記録',sent_confirmed:'手動送信を記録済み',ignored:'対応不要',send_unknown:'旧送信結果は要確認',pending:'承認待ち',approved:'承認済み',excluded:'利用除外',quarantined:'要修正・隔離',revoked:'利用停止'};
+  const routes=[['a/saitama-shibakawa','さいたま芝川'],['a/sugishita','杉下'],['a/mizuhodai','みずほ台'],['a/kamekubo','亀久保'],['a/ageo-fujimi','上尾富士見'],['a/ageo-shibakawa','上尾芝川'],['a/kasumigaseki-nishi','霞ヶ関西']];
+  function el(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;}
+  function area(parent,label,value){const id='f-'+Math.random().toString(36).slice(2),l=el('label',label),n=el('textarea');n.id=id;l.htmlFor=id;n.value=value||'';parent.append(l,n);return n;}
+  function input(parent,label,type='text'){const id='f-'+Math.random().toString(36).slice(2),l=el('label',label),n=el('input');n.type=type;n.id=id;l.htmlFor=id;parent.append(l,n);return n;}
+  function select(parent,label,options){const l=el('label',label),n=el('select');for(const [value,text]of options){const o=el('option',text);o.value=value;n.append(o);}l.append(n);parent.append(l);return n;}
+  function check(parent,label){const l=el('label',undefined,'check'),n=el('input');n.type='checkbox';l.append(n,el('span',label));parent.append(l);return n;}
+  function button(parent,label,fn,primary=false){const b=el('button',label,primary?'primary':'');b.type='button';b.onclick=async()=>{b.disabled=true;try{await fn();}catch(e){notice(e.message);}finally{b.disabled=false;}};parent.append(b);return b;}
+  function notice(s){$('notice').textContent=s||'';}
+  async function api(path,data){const r=await fetch('/assistant/api/'+path,{method:data===undefined?'GET':'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:data===undefined?undefined:JSON.stringify(data),cache:'no-store'});const d=await r.json();if(!r.ok||d.ok===false)throw Error(d.code||'request_failed');return d;}
+  async function reload(){state=await api('messages');$('summary').textContent=`Aチーム7会場 · 対応中 ${state.countActive}件 · 本人の承認済み事例 ${state.style.sampleCount}件 · API ${state.apiEnabled?'有効':'停止中'}`;render();}
+  function render(){root.replaceChildren();$('tabs').replaceChildren();for(const [id,title] of [['inbox','受信箱'],['history','過去の対応'],['templates','テンプレート'],['feedback','送信記録・改善'],['settings','方針・利用状況']]){const b=button($('tabs'),title,async()=>{view=id;if(id==='feedback')feedback=(await api('feedback')).feedback;render();});if(view===id)b.className='selected';}({inbox,history,templates,feedback:feedbackView,settings}[view])();}
+  function inbox(){const top=el('details');top.append(el('summary','問い合わせを手動で追加'));const route=select(top,'会場',routes),text=area(top,'問い合わせ本文','');button(top,'受信箱に追加',async()=>{const r=await api('manual',{route:route.value,text:text.value});await api('redraft',{id:r.id});await reload();},true);root.append(top);
+    if(!state.messages.length)root.append(el('p','問い合わせはまだありません。Webhook受信または手動追加で開始します。','empty'));
+    for(const m of state.messages){const c=el('article',undefined,'card');c.append(el('span',labels[m.status]||m.status,'badge'),el('span',routes.find(r=>r[0]===m.route)?.[1]||m.route,'badge'),el('span',new Date(m.received_at).toLocaleString('ja-JP'),'muted'));
+      const grid=el('div',undefined,'grid'),left=el('div'),right=el('div');left.append(el('h3','問い合わせ'),el('div',m.body||'画像・スタンプなどはLINE管理画面でご確認ください。','inquiry'));
+      const context=state.messages.filter(x=>x.route===m.route&&x.user_id===m.user_id&&x.id!==m.id).slice(0,5);if(context.length){const d=el('details');d.append(el('summary','同じ相手との最近の受信'));context.forEach(x=>d.append(el('pre',x.body)));left.append(d);}
+      if(m.error)right.append(el('p',m.error,'warn'));
+      const reply=area(right,'返信案 / 実際に送る文',m.draft);reply.maxLength=4000;
+      if(m.meta){right.append(el('small',m.meta.generator==='openai'?'OpenAI APIで生成':'ローカル参考文・API未使用','muted'));const w=el('div',undefined,'warn');for(const x of m.meta.checks||[])w.append(el('div','・'+x));right.append(w);
+        const d=el('details');d.append(el('summary','参照事例・テンプレート・正本'));for(const id of m.meta.caseIds||[]){const x=state.cases.find(x=>x.id===id);if(x)d.append(el('pre',x.category+' / '+x.reply));}for(const id of m.meta.templateIds||[]){const t=state.templates.find(t=>t.id===id);if(t)d.append(el('pre','テンプレート: '+t.body));}d.append(el('pre',JSON.stringify(m.meta.facts,null,2)));right.append(d);}
+      const actions=el('div',undefined,'actions');if(['new','draft_ready','copied','draft_failed'].includes(m.status))button(actions,'返信案を作成・更新',async()=>{await api('redraft',{id:m.id});await reload();});
+      if(['draft_ready','copied'].includes(m.status)){
+        button(actions,'文章をコピー',async()=>{if(!reply.value.trim())throw Error('本文を入力してください');await navigator.clipboard.writeText(reply.value);await api('copied',{id:m.id,versionId:m.meta.versionId});m.status='copied';notice('コピーしました。LINE公式管理画面で手動送信してください。まだ送信済みとして記録していません。');},true);
+        const sent=el('details');sent.append(el('summary','LINEで手動送信した後に記録'));const at=input(sent,'実際の送信日時','datetime-local');at.value=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
+        const confirmed=check(sent,'LINE公式管理画面で、この本文を実際に送信したことを確認しました');const newer=check(sent,'後から届いたメッセージも確認済みです（該当する場合）');
+        button(sent,'送信済みを登録',async()=>{if(!confirmed.checked)throw Error('実際の送信を確認してください');await api('confirm-sent',{id:m.id,versionId:m.meta.versionId,text:reply.value,sentAt:new Date(at.value).toISOString(),confirmed:true,reviewedNewer:newer.checked});notice('手動送信の確認を記録しました。学習候補は「過去の対応」で確認・承認できます。');await reload();});right.append(sent);
+      }
+      if(!['sent','sent_confirmed'].includes(m.status))button(actions,'対応不要にする',async()=>{await api('dismiss',{id:m.id});await reload();});right.append(actions);grid.append(left,right);c.append(grid);root.append(c);
+    }
+  }
+  function history(){root.append(el('h2','過去の対応を、確認できる事例に'));
+    const d=el('details');d.open=state.cases.length===0;d.append(el('summary','CSV・JSONを取り込む / 1件ずつ登録する'));const route=select(d,'会場',routes),author=select(d,'執筆者',[['unknown','不明'],['owner','平田 陸（本人）'],['staff','他スタッフ']]);
+    const file=input(d,'履歴ファイル（UTF-8 / Shift_JISのCSV、JSON）','file');file.accept='.csv,.json';const encoding=select(d,'文字コード',[['utf-8','UTF-8'],['shift_jis','Shift_JIS']]);
+    const mode=select(d,'CSV形式',[['paired','問い合わせと返信が同じ行'],['messages','送受信メッセージを時系列で組み合わせる']]);const map=area(d,'CSV列の対応（必要に応じて変更）',JSON.stringify({inquiryColumn:'inquiry',replyColumn:'reply',conversationColumn:'conversation_id',directionColumn:'direction',textColumn:'text',timeColumn:'timestamp',incomingValue:'in',outgoingValue:'out'},null,2));
+    button(d,'ファイルを取り込む',async()=>{const f=file.files[0];if(!f)throw Error('ファイルを選んでください');if(f.size>500000)throw Error('1回500KBまでです');const text=new TextDecoder(encoding.value).decode(await f.arrayBuffer());const payload=f.name.endsWith('.json')?{rows:JSON.parse(text)}:{csv:text,options:{...JSON.parse(map.value),mode:mode.value,route:route.value,author:author.value,source:'LINE履歴CSV',authorshipBasis:'管理者が指定'}};const r=await api('import',payload);notice(`${r.inserted}件取り込み、${r.quarantined}件を隔離しました。取り込んだだけでは承認されません。`);await reload();});
+    const inquiry=area(d,'問い合わせ（個人情報を除く）',''),reply=area(d,'実際に送信済みの返信','');button(d,'この1件を履歴として登録',async()=>{await api('import',{rows:[{route:route.value,inquiry:inquiry.value,reply:reply.value,author:author.value,source:'管理者による履歴確認',authorshipBasis:'管理者が指定'}]});await reload();});root.append(d);
+    for(const x of state.cases){const c=el('article',undefined,'card');c.append(el('span',x.category,'badge'),el('span',labels[x.status]||x.status,'badge'),el('span',x.author==='owner'?'本人':x.author==='staff'?'スタッフ':'執筆者不明','badge'));const qi=area(c,'問い合わせ',x.inquiry),re=area(c,'実返信',x.reply),a=select(c,'執筆者',[['owner','平田 陸'],['staff','他スタッフ'],['unknown','不明']]);a.value=x.author;c.append(el('p',x.authorshipBasis+' / '+x.evidence+' / '+x.source,'muted'));if(x.warnings.length)c.append(el('p',x.warnings.join(' / '),'warn'));
+      const privacy=check(c,'氏名・住所・連絡先・医療情報等を除き、現在の方針に合う汎用的な文体例として使用してよいことを確認');const actions=el('div',undefined,'actions');button(actions,'修正して承認',async()=>{await api('case-review',{caseId:x.id,inquiry:qi.value,reply:re.value,author:a.value,status:'approved',privacyReviewed:privacy.checked});await api('extract',{});await reload();},true);button(actions,'利用から除外',async()=>{await api('case-review',{caseId:x.id,status:'excluded'});await reload();});c.append(actions);root.append(c);}
+  }
+  function templates(){root.append(el('h2','承認した言葉を、次の返信へ'));button(root,'承認済み事例からテンプレートを抽出',async()=>{await api('extract',{});await reload();});if(!state.templates.length)root.append(el('p','過去の対応を承認すると、文体をもとにテンプレート候補が作られます。','empty'));
+    for(const t of state.templates){const c=el('article',undefined,'card');c.append(el('span',t.category,'badge'),el('span',labels[t.status]||t.status,'badge'),el('span','改訂 '+t.version,'muted'));const cat=select(c,'分類',['体験申し込み','体験日時変更','欠席','退会','会費','活動予定','その他'].map(x=>[x,x]));cat.value=t.category;const body=area(c,'テンプレート本文',t.body);c.append(el('p','{確認済み日付}などは、最新正本で確認できた場合だけ使います。','muted'));const privacy=check(c,'個人情報・古い事実を除き、文体テンプレートとして承認します');const actions=el('div',undefined,'actions');button(actions,'編集内容を承認',async()=>{await api('template',{templateId:t.id,body:body.value,category:cat.value,status:'approved',privacyReviewed:privacy.checked});await reload();},true);button(actions,'利用を停止',async()=>{await api('template',{templateId:t.id,status:'revoked'});await reload();});c.append(actions);root.append(c);}
+  }
+  function feedbackView(){root.append(el('h2','送信した文章から改善する'));for(const f of feedback){const c=el('article',undefined,'card');c.append(el('span',f.category,'badge'),el('span',f.status==='active'?'手動送信確認済み':'学習から除外','badge'),el('p',f.sentAt,'muted'));const grid=el('div',undefined,'grid'),a=el('div'),b=el('div');a.append(el('h3','AIの返信案'),el('pre',f.draft));b.append(el('h3','実際の最終返信'),el('pre',f.final));grid.append(a,b);c.append(grid);if(f.status==='active')button(c,'この修正を学習から除外',async()=>{await api('feedback-revoke',{feedbackId:f.id});feedback=(await api('feedback')).feedback;await reload();});root.append(c);}for(const s of state.suggestions){const c=el('div',undefined,'card');c.append(el('h3',s.category+' / 同じ修正 '+s.count+'件'),el('pre',s.body),el('p','最終返信の内容を確認し、テンプレート候補にできます。','muted'));button(c,'改善テンプレートを提案',async()=>{await api('suggest',{feedbackId:s.feedbackIds[0]});view='templates';await reload();});root.append(c);}if(!feedback.length)root.append(el('p','コピーした文章は送信履歴に入りません。実際の手動送信後に記録してください。','empty'));}
+  function settings(){root.append(el('h2','運用ルールと費用管理'));const c=el('div',undefined,'card');for(const r of state.rules)c.append(el('p','・'+r));c.append(el('p','方針版: '+state.policyVersion,'muted'),el('p','API: '+(state.apiEnabled?'有効':'停止中')+' / モデル: '+(state.model||'未設定')),el('p','月間上限: '+state.monthlyRequests+'回 / '+state.monthlyTokens+'トークン'),el('pre',JSON.stringify(state.usage||{requests:0,tokensReserved:0,actualTokens:0},null,2)),el('p','氏名・LINE ID・会話原文はモデル入力に含めません。承認した汎用文体例と問い合わせ種別、照合結果のみを使います。履歴とテンプレートの個人情報除去を確認してください。','privacy'));root.append(c);}
+  $('connect').onclick=async()=>{token=$('token').value;$('token').value='';try{await reload();$('login').hidden=true;$('app').hidden=false;notice('');}catch(e){token='';notice('ログインできません: '+e.message);}};
+  $('refresh').onclick=()=>reload().catch(e=>notice(e.message));$('logout').onclick=()=>{token='';state={};feedback=[];root.replaceChildren();$('app').hidden=true;$('login').hidden=false;notice('ログアウトしました。');};
+}
+// Wrangler preserves function names with __name; provide that helper inside the served script.
+export const assistantClientJs='const __name=(fn)=>fn;('+client.toString()+')();';

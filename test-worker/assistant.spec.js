@@ -20,10 +20,13 @@ it('deduplicates verified A-team events in durable SQLite without sending',async
   expect(network).not.toHaveBeenCalled();
 });
 
-it('only draft_ready is eligible for explicit send and never auto sends',async () => {
+it('copying is separate from confirmation and never sends',async () => {
   const obj=inbox(),row=event('event-for-send-001','会場について');
   await obj.receive([row]);
-  expect((await obj.claimSend(row.id,'返信')).ok).toBe(false);
+  expect((await obj.generate(row.id)).ok).toBe(true);
+  const generated=(await obj.list()).messages[0];
+  expect((await obj.copied({id:row.id,versionId:generated.meta.versionId})).sent).toBe(false);
+  expect((await obj.feedbackList()).feedback).toHaveLength(0);
   // Test an approved model draft without calling the external model.
   // The assistant UI cannot send a message that is still unreviewed.
   const newer=event('event-for-send-002','追加質問',row.receivedAt+1000);

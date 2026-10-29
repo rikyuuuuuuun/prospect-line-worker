@@ -42,11 +42,12 @@ export const DRAFT_INSTRUCTIONS = [
   '空き状況、料金、振替可否、体験日、入会手続き等の未確認事項を断定しないでください。',
   '確認が必要な場合は確認する旨か、必要最小限の質問を返信に含めてください。',
   '個人情報や子どもの情報の繰り返しを最小限にし、本文に不要な識別情報を含めないでください。',
+  '欠席時の振替制度はありません。振替を案内・提案しないでください。',
   '体験後、入会しなかった人への営業フォローはしない方針です。',
 ].join('\n');
 export function extractResponseText(response) {
   const parts = Array.isArray(response?.output) ? response.output : [];
   return parts.flatMap(part => Array.isArray(part?.content) ? part.content : [])
     .filter(part => part?.type === 'output_text' && typeof part.text === 'string')
-    .map(part => part.text).join('\n').trim().slice(0, 2000);
+    .map(part => part.text).join('\n').trim();
 }
