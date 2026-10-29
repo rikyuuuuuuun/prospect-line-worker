@@ -20,12 +20,19 @@ it('deduplicates verified A-team events in durable SQLite without sending',async
   expect(network).not.toHaveBeenCalled();
 });
 
-it('only draft_ready is eligible for explicit send and never auto sends',async () => {
-  const obj=inbox(),row=event('event-for-send-001','会場について');
+it('copying is separate from confirmation and never sends',async () => {
+  const obj=inbox(),row=event('event-for-send-001','体調不良でお休みします');
+  const reply='承知いたしました！\nお大事になさってください！';
+  await obj.importCases({rows:[{route,inquiry:row.body,reply,author:'owner'}]});
+  const source=(await obj.list()).cases[0];
+  await obj.reviewCase({caseId:source.id,status:'approved',privacyReviewed:true});
   await obj.receive([row]);
-  expect((await obj.claimSend(row.id,'返信')).ok).toBe(false);
-  // Test an approved model draft without calling the external model.
-  // The assistant UI cannot send a message that is still unreviewed.
+  expect((await obj.generate(row.id)).ok).toBe(true);
+  const generated=(await obj.list()).messages[0];
+  expect(generated.draft).toBe(reply);
+  expect((await obj.copied({id:row.id,versionId:generated.meta.versionId,text:generated.draft,noMakeup:true,noFollowup:true,factsChecked:true,reviewedMessageIds:[]})).sent).toBe(false);
+  expect((await obj.feedbackList()).feedback).toHaveLength(0);
+  // An exact draft comes from the approved source without calling a model.
   const newer=event('event-for-send-002','追加質問',row.receivedAt+1000);
   await obj.receive([newer]);
   expect((await obj.list()).countActive).toBe(2);
