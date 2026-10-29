@@ -15,6 +15,7 @@ export class AssistantInbox extends DurableObject {
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_msg_user_time ON messages(route,user_id,received_at)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS assistant_records(id TEXT PRIMARY KEY,kind TEXT NOT NULL,body TEXT NOT NULL,modified_at INTEGER NOT NULL)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_assistant_kind ON assistant_records(kind)');
+    this.sql.exec("UPDATE assistant_records SET body=json_set(body,'$.createdAt',modified_at) WHERE kind IN ('template','message-meta','input','draft-version','feedback') AND json_extract(body,'$.createdAt') IS NULL");
     this.sql.exec("UPDATE messages SET status='send_unknown' WHERE status='sending'");
   }
   rows(q,...p){return this.sql.exec(q,...p).toArray();}
@@ -24,10 +25,16 @@ export class AssistantInbox extends DurableObject {
   message(id){return this.rows('SELECT * FROM messages WHERE id=?',id)[0];}
   newer(row){return this.rows("SELECT id,kind,body,received_at FROM messages WHERE route=? AND user_id=? AND received_at>=? AND id<>? AND status<>'expired' ORDER BY received_at",row.route,row.user_id,row.received_at,row.id);}
   async schedule(ms){const at=Date.now()+ms,old=await this.ctx.storage.getAlarm();if(!old||old>at)await this.ctx.storage.setAlarm(at);}
+  async scheduleRetention(){
+    const message=this.rows("SELECT min(received_at) AS at FROM messages WHERE status<>'expired'")[0]?.at;
+    const records=this.rows("SELECT min(CAST(json_extract(body,'$.createdAt') AS INTEGER)) AS at FROM assistant_records WHERE kind IN ('case','template','message-meta','input','draft-version','feedback') AND coalesce(json_extract(body,'$.status'),'')<>'expired' AND coalesce(json_extract(body,'$.retentionProcessed'),0)=0")[0]?.at;
+    const times=[message,records].filter(x=>Number.isFinite(x)&&x>0).map(x=>x+RAW_RETENTION_DAYS*86400000);
+    await this.schedule(times.length?Math.max(500,Math.min(86400000,Math.min(...times)-Date.now()+1)):86400000);
+  }
   async receive(items){let inserted=0;this.expireRaw();
     for(const r of items.slice(0,50)){if(!A_ROUTE_SET.has(r.route)||!r.id.startsWith(r.route+':')||this.message(r.id))continue;
       this.sql.exec('INSERT INTO messages(id,route,user_id,kind,body,received_at,status,modified_at) VALUES(?,?,?,?,?,?,?,?)',r.id,r.route,r.userId,r.kind,r.body,r.receivedAt,r.status,Date.now());inserted++;}
-    if(inserted)await this.schedule(this.env.ASSISTANT_AUTO_DRAFT==='true'?500:86400000);return {ok:true,inserted};
+    if(inserted){await this.scheduleRetention();if(this.env.ASSISTANT_AUTO_DRAFT==='true')await this.schedule(500);}return {ok:true,inserted};
   }
   retentionPlan(now=Date.now()){
     const cutoff=now-RAW_RETENTION_DAYS*86400000;
@@ -47,12 +54,12 @@ export class AssistantInbox extends DurableObject {
       else {c.inquiry='';c.reply='';c.status='expired';c.source='保存期限経過';c.authorshipBasis='';}
       c.retentionProcessed=true;this.put('case',c);
     }
-    for(const t of this.records('template').filter(t=>t.createdAt&&t.createdAt<cutoff&&!(t.status==='approved'&&t.privacyReviewed)))this.put('template',{...t,body:'',source:'保存期限経過',status:'expired'});
+    for(const t of this.records('template').filter(t=>t.createdAt&&t.createdAt<cutoff&&!t.retentionProcessed))this.put('template',t.status==='approved'&&t.privacyReviewed?{...t,source:'承認済みの匿名テンプレート',retentionProcessed:true}:{...t,body:'',source:'保存期限経過',status:'expired',retentionProcessed:true});
     this.sql.exec("DELETE FROM assistant_records WHERE kind IN ('throttle','copy-review') AND modified_at<?",cutoff);
     return {ok:true,expired:ids.size};
   }
   async list(p={}){
-    this.expireRaw();const offset=Math.max(0,Math.min(100000,Number(p.offset)||0)),limit=100;
+    this.expireRaw();await this.scheduleRetention();const offset=Math.max(0,Math.min(100000,Number(p.offset)||0)),limit=100;
     const messages=this.rows("SELECT * FROM messages ORDER BY CASE WHEN status IN ('sent','sent_confirmed','ignored','expired') THEN 1 ELSE 0 END,received_at DESC LIMIT ? OFFSET ?",limit,offset).map(m=>({...m,meta:this.record('meta:'+m.id),input:this.record('input:'+m.id),newerMessages:m.user_id?this.newer(m):[]}));
     const total=Number(this.rows('SELECT count(*) AS n FROM messages')[0].n);
     return {ok:true,messages,offset,nextOffset:offset+limit<total?offset+limit:null,total,countActive:Number(this.rows("SELECT count(*) AS n FROM messages WHERE status NOT IN ('sent','ignored','sent_confirmed','expired')")[0].n),cases:this.records('case'),templates:this.records('template'),suggestions:correctionSuggestions(this.records('feedback')),style:styleProfile(this.records('case')),rules:RULES,policyVersion:POLICY_VERSION,usage:this.record('budget:'+budgetMonth()),retention:this.retentionPlan(),apiEnabled:this.env.ASSISTANT_API_ENABLED==='true',model:this.env.ASSISTANT_MODEL||'',monthlyRequests:Number(this.env.ASSISTANT_MONTHLY_REQUEST_LIMIT||0),monthlyTokens:Number(this.env.ASSISTANT_MONTHLY_TOKEN_LIMIT||0),monthlyUsd:Number(this.env.ASSISTANT_MONTHLY_USD_LIMIT||0)};
@@ -63,13 +70,13 @@ export class AssistantInbox extends DurableObject {
     const item={id:'input:'+p.id,messageId:p.id,bodyHash:p.bodyHash,text:p.text.trim(),privacyReviewed:true,safeForModel:true,procedureContextConfirmed:p.procedureContextConfirmed===true,reviewedAt:Date.now(),createdAt:Date.now()};this.put('input',item);
     this.invalidateMessage(p.id);if(!TERMINAL.includes(row.status)&&row.status!=='drafting')this.sql.exec("UPDATE messages SET status='new',error='' WHERE id=?",p.id);if(this.env.ASSISTANT_AUTO_DRAFT==='true')await this.schedule(500);return {ok:true};
   }
-  async alarm(){if(this.env.ASSISTANT_ENABLED!=='true')return;this.expireRaw();
+  async alarm(){this.expireRaw();if(this.env.ASSISTANT_ENABLED!=='true'){await this.scheduleRetention();return;}
     this.sql.exec("UPDATE messages SET status='draft_failed',error='生成が中断しました。手動で再生成してください' WHERE status='drafting' AND modified_at<?",Date.now()-120000);
     if(this.env.ASSISTANT_AUTO_DRAFT==='true'){
       const row=this.rows("SELECT id,body FROM messages WHERE status IN ('new','privacy_review') ORDER BY received_at").find(r=>this.record('input:'+r.id)?.safeForModel||deriveSafeInquiry(r.body));
       if(row)await this.generate(row.id,{automatic:true});
     }
-    await this.schedule(86400000);
+    await this.scheduleRetention();
     if(this.env.ASSISTANT_AUTO_DRAFT==='true'&&this.rows("SELECT id,body FROM messages WHERE status IN ('new','privacy_review')").some(r=>this.record('input:'+r.id)?.safeForModel||deriveSafeInquiry(r.body)))await this.schedule(1000);
   }
   reserveBudget(tokens,model){const price=PRICES[model];if(!price)throw Error('model_not_allowed');
@@ -132,7 +139,7 @@ export class AssistantInbox extends DurableObject {
     }catch(e){const code=/^[a-z_]+$/.test(e.message)?e.message:'draft_failed';if(this.message(id)?.status==='drafting')this.sql.exec("UPDATE messages SET status='draft_failed',error=?,modified_at=? WHERE id=?",code,Date.now(),id);return {ok:false,code};}
   }
   async importCases(p){const rows=p.csv!==undefined?csvCases(p.csv,p.options||{}):p.rows;if(!Array.isArray(rows)||!rows.length||rows.length>200)throw Error('invalid_import');const existing=this.records('case');if(existing.length+rows.length>2000)throw Error('case_capacity_reached');const normalized=rows.map(normalizeCase);let inserted=0;
-    for(const c of normalized){if(existing.some(e=>e.route===c.route&&e.inquiry===c.inquiry&&e.reply===c.reply))continue;this.put('case',c);existing.push(c);inserted++;}return {ok:true,inserted,quarantined:normalized.filter(c=>c.status==='quarantined').length};}
+    for(const c of normalized){if(existing.some(e=>e.route===c.route&&e.inquiry===c.inquiry&&e.reply===c.reply))continue;this.put('case',c);existing.push(c);inserted++;}await this.scheduleRetention();return {ok:true,inserted,quarantined:normalized.filter(c=>c.status==='quarantined').length};}
   invalidateMessage(id){const row=this.message(id);if(row&&['draft_ready','draft_review','copied'].includes(row.status))this.sql.exec("UPDATE messages SET status='draft_failed',error='参照内容が変更されました。再生成してください' WHERE id=?",id);}
   invalidateKnowledge(field,id){for(const m of this.records('message-meta'))if(m[field]?.includes(id))this.invalidateMessage(m.messageId||m.id.slice(5));}
   async reviewCase(p){const original=this.record(p.caseId);if(!original||!this.records('case').some(c=>c.id===p.caseId))throw Error('case_not_found');const c={...original};
@@ -159,7 +166,7 @@ export class AssistantInbox extends DurableObject {
     t.usage=p.usage||t.usage||'inbound_reply';t.status=p.status;t.privacyReviewed=p.privacyReviewed===true;t.version++;this.put('template',t);this.invalidateKnowledge('templateIds',t.id);return {ok:true};
   }
   async importTemplates(p){if(!Array.isArray(p.rows)||!p.rows.length||p.rows.length>50)throw Error('invalid_import');const rows=p.rows.map(r=>{if(!A_ROUTE_SET.has(r.route)||typeof r.body!=='string'||!r.body.trim()||r.body.length>4000)throw Error('invalid_template');return r;});let inserted=0;
-    for(const r of rows){if(this.records('template').some(t=>t.body===r.body&&t.route===r.route))continue;this.put('template',{id:crypto.randomUUID(),route:r.route,category:CATEGORIES.includes(r.category)?r.category:classify(r.title),body:r.body,title:String(r.title||'既存定型文').slice(0,80),source:String(r.source||'LINE定型文').slice(0,300),status:'pending',privacyReviewed:false,caseIds:[],version:1,createdAt:Date.now()});inserted++;}return {ok:true,inserted};}
+    for(const r of rows){if(this.records('template').some(t=>t.body===r.body&&t.route===r.route))continue;this.put('template',{id:crypto.randomUUID(),route:r.route,category:CATEGORIES.includes(r.category)?r.category:classify(r.title),body:r.body,title:String(r.title||'既存定型文').slice(0,80),source:String(r.source||'LINE定型文').slice(0,300),status:'pending',privacyReviewed:false,caseIds:[],version:1,createdAt:Date.now()});inserted++;}await this.scheduleRetention();return {ok:true,inserted};}
   async copied(p){const row=this.message(p.id),meta=this.record('meta:'+p.id);if(!row||!['draft_ready','draft_review','copied'].includes(row.status)||meta?.schemaVersion!==2||p.versionId!==meta.versionId||!this.referencesValid(meta))throw Error('stale_draft');
     const newer=this.newer(row);if(newer.some(m=>!Array.isArray(p.reviewedMessageIds)||!p.reviewedMessageIds.includes(m.id)))return {ok:false,code:'newer_message_requires_review',newerMessages:newer};
     if(!p.noMakeup||!p.noFollowup||!p.factsChecked)throw Error('reply_review_required');if(typeof p.text!=='string'||!p.text.trim()||p.text.length>4000)throw Error('invalid_reply');
