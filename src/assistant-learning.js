@@ -113,6 +113,7 @@ export function deriveSafeInquiry(text){
   else if(category==='退会')parts.push('退会の希望または相談。退会処理は未確認。');
   else if(category==='欠席')parts.push(/休会/.test(s)?'休会についての相談。適用条件は要確認。':/体調|熱|病|風邪/.test(s)?'体調不良による欠席の連絡。':'欠席または振替についての連絡。');
   if(!parts.length)return null;
+  const requestedClasses=s.match(/前半|後半|相談したい/g);if(requestedClasses)parts.push('問い合わせにあるクラス: '+[...new Set(requestedClasses)].join('、')+'。受付状態は正本で確認する。');
   const relative=s.match(/明後日|明日|再来週|来週|今週|今日|本日/g);if(relative)parts.push('問い合わせにある時期: '+[...new Set(relative)].join('、')+'。具体的な日時の確定には正本または匿名本文の確認が必要。');
   return parts.join('\n');
 }

@@ -2,8 +2,22 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {classify,inspectReply,policyWarnings,typedClaims,csvCases,buildModelInput,skeleton,deriveSafeInquiry} from '../src/assistant-learning.js';
 import {redactText,budgetMonth} from '../src/assistant-privacy.js';
-import {memberFacts,readAvailabilityFacts,readCurrentFacts} from '../src/assistant-sources.js';
+import {memberFacts,readAvailabilityFacts,readCurrentFacts,sourceVenueMatches} from '../src/assistant-sources.js';
 const route='a/saitama-shibakawa';
+test('safe inquiry retains class selection needed to distinguish live waitlist and open classes',()=>{
+  assert.match(deriveSafeInquiry('前半の体験に参加したいです。'),/クラス: 前半/);
+  assert.match(deriveSafeInquiry('後半の体験を希望しています。'),/クラス: 後半/);
+});
+test('live receipt venue codes match only their canonical A-team route',()=>{
+  assert.equal(sourceVenueMatches('01_さいたま芝川',route),true);
+  assert.equal(sourceVenueMatches('さいたま芝川',route),true);
+  assert.equal(sourceVenueMatches('02_さいたま芝川',route),false);
+  assert.equal(sourceVenueMatches('02_杉下',route),false);
+  const receipt=[];receipt[3]='2026/10/29 17:02:41';receipt[4]='A';receipt[5]='04_亀久保';receipt[8]='fixture-parent';receipt[13]='要確認';receipt[23]='保留';
+  const now=Date.parse('2026-10-29T13:00:00Z');
+  assert.equal(memberFacts([],[receipt],'a/kamekubo','fixture-parent',now).reservationStatus,'received');
+  assert.equal(memberFacts([],[receipt],route,'fixture-parent',now).reservationStatus,'unknown');
+});
 for(const reply of ['振り替えでご参加いただけます','別の曜日のクラスにご参加いただいても大丈夫です','振替はございませんが、他の日に来ていただければ対応します','振替制度はありませんが、今回は特別に振替できます','ふりかえで参加できます','ご入会について\nいかがでしょうか？','ぜひご入会お待ちしております','体験後のご感想はいかがでしたか？'])test('audit rule counterexample: '+reply,()=>assert.ok(policyWarnings(reply).length));
 for(const reply of ['退会を承りました','お手続きが済みました','体験のご予約を承りました！当日お待ちしております','日程を変更いたしました','ご参加いただけます','月会費は三千円です','来週土曜の十時からです'])test('audit unverified fact: '+reply,()=>assert.ok(inspectReply(reply).length));
 test('typed facts do not authorize money or time using digits from dates',()=>{

@@ -1,4 +1,6 @@
-import { A_ROUTE_SET, labelForRoute } from './assistant-policy.js';
+import { A_ROUTES, A_ROUTE_SET, labelForRoute } from './assistant-policy.js';
+const SOURCE_VENUES=new Map(A_ROUTES.map((route,index)=>[route,new Set([labelForRoute(route),String(index+1).padStart(2,'0')+'_'+labelForRoute(route)])]));
+export function sourceVenueMatches(value,route){return SOURCE_VENUES.get(route)?.has(String(value||'').trim())===true;}
 const enc=new TextEncoder();
 const b64=bytes=>btoa(String.fromCharCode(...bytes)).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
 async function googleToken(raw,fetcher) {
@@ -18,13 +20,13 @@ export function sourceDate(value){
   return m?Date.UTC(+m[1],+m[2]-1,+m[3],+(m[4]||0)-9,+(m[5]||0),+(m[6]||0)):NaN;
 }
 export function memberFacts(links,receipts,route,userId,now=Date.now()) {
-  const checks=[],matches=links.filter(r=>r[1]===userId&&String(r[16]).replace(/^\/+|\/+$/g,'')===route&&r[11]==='A'&&r[12]===labelForRoute(route));
+  const checks=[],matches=links.filter(r=>r[1]===userId&&String(r[16]).replace(/^\/+|\/+$/g,'')===route&&r[11]==='A'&&sourceVenueMatches(r[12],route));
   const confirmed=matches.filter(r=>/^(連携済|連携済み|確定|linked|confirmed)$/.test(r[13]||''));
   const identities=confirmed.map(r=>r[3]||r[4]);let membership='unknown';
   if(confirmed.length===1||confirmed.length>1&&identities.every(Boolean)&&new Set(identities).size===identities.length){
     const active=confirmed.filter(r=>/^(在籍|在籍中|active)$/.test(r[10]));membership=active.length===confirmed.length?'active':active.length?'mixed':'other';
   }else checks.push('会員連携が未確認、または人物照合が一意ではありません');
-  const trials=receipts.filter(r=>r[8]===userId&&r[4]==='A'&&r[5]===labelForRoute(route));
+  const trials=receipts.filter(r=>r[8]===userId&&r[4]==='A'&&sourceVenueMatches(r[5],route));
   const today=new Date(now+9*3600000).toISOString().slice(0,10);
   const recent=trials.filter(r=>{
     const updated=sourceDate(r[3]||r[2]),date=sourceDate(r[14]);

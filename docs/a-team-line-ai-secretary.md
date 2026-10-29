@@ -73,7 +73,7 @@ npm run dev:assistant
 
 ## 本番へ進む前に残る作業
 
-1. 所有者の公開GitHub保存・main統合・本番配備の承認。現在はローカルの監査修正版のみ。公開mainには旧送信経路が残るため、送信トークンの追加や旧機能の有効化をしない。
+1. 公開GitHub保存は所有者承認により完了し、ドラフトPR #22で管理。main統合・本番配備は未承認。公開mainには旧送信経路が残るため、送信トークンの追加や旧機能の有効化をしない。
 2. 所有者による実事例・テンプレートの内容承認と、他会場・不足分類の履歴追加。
 3. OpenAI専用プロジェクトのキー・残高・モデル・料金上限の設定。秘密の新規入力は本人操作。チャットに貼らない。
 4. `ASSISTANT_GOOGLE_SERVICE_ACCOUNT`、`ASSISTANT_MASTER_SHEET_ID`、`ASSISTANT_ADMIN_TOKEN`を設定。新しく権限を広げる場合は別途承認。
@@ -90,3 +90,17 @@ Messaging APIから過去の管理画面手動返信を一括取得できる前�
 チャットProの公式説明は月3000円税別、最大5年の履歴閲覧・CSVダウンロード。確認した芝川は未購入。現在見える会話と既存定型文から開始できる。購入していない。[LINE公式説明](https://www.lycbiz.com/jp/service/line-official-account/chat-pro-option/)
 
 Notion参照：[Prospect Brain](https://app.notion.com/p/3bc315f1533081fa84e6fefadd1b28b9)、[正本管理マップ](https://app.notion.com/p/3fc315f1533081bbad43f01deca78045)、[PT-17](https://app.notion.com/p/3f5315f15330818ba0a8dfccc1df3d41)。
+
+## 実API評価の再実行
+
+`src/assistant-model.js`を運用と評価で共有し、同じResponses API入力を使う。評価用の匿名データ・結果・APIキーは公開リポジトリの外へ保存する。評価専用の参照コピーを使っても、運用データを承認済みに変更しない。
+
+```
+node scripts/evaluate-assistant.mjs --plan ../evaluation/plan.anonymous.json --output ../evaluation/results.json
+```
+
+既定はAPIを呼ばない事前確認。`OPENAI_API_KEY`をプロセス環境へ安全に渡し、`--execute`を付けると実行する。最大12件・合計1ドルまで。呼出し前に費用を予約してチェックポイントを保存し、実使用量で精算する。失敗や使用量不明の要求は自動再試行しない。同じ結果ファイルの完了済み要求は再実行しない。
+
+対象の実返信を参考入力から除く比較と、参考事例なしの対照を分ける。文字数・感嘆符・絵文字・編集距離は参考値であり、文体の正解率ではない。過去の退会処理完了や物品発見を現在の事実として再現した場合は不合格とする。本人による比較確認が必要。
+
+実データの読取では、`14_LINE体験受付`の会場は`01_さいたま芝川`等の番号付きだった。既知のAチーム正規名と対応する番号付き名のみを照合し、別の会場を混同しない。日程・受付状態は活動カレンダー、運用入力、配信中のSnapshotを照合する。Google Drive経由の確認と、Workerサービスアカウントの実接続は別の検証として記録する。
