@@ -42,13 +42,13 @@ test('unverified financial, reservation and date claims cannot pass the guard',(
   assert.deepEqual(guardReply('欠席の件、承知いたしました。振替はありません。'),[]);
 });
 test('only repeated active sent corrections yield improvement proposals',()=>{
-  const f={category:'欠席',draft:'承りました',final:'承知いたしました！',status:'active'};
+  const f={route,author:'owner',category:'欠席',draft:'承りました',final:'承知いたしました！',status:'active'};
   assert.equal(correctionSuggestions([f]).length,0);assert.equal(correctionSuggestions([f,{...f,id:'2'}]).length,1);
   assert.equal(correctionSuggestions([f,{...f,status:'revoked'}]).length,0);
 });
 test('read-only source projection fails closed and never upgrades received to completed',async()=>{
   const link=[];link[1]='user';link[10]='在籍';link[11]='A';link[12]='さいたま芝川';link[13]='linked';link[16]=route;link[7]='private child';
-  const receipt=[];receipt[4]='A';receipt[5]='さいたま芝川';receipt[8]='user';receipt[23]='反映済';
+  const receipt=[];receipt[3]=new Date().toISOString();receipt[4]='A';receipt[5]='さいたま芝川';receipt[8]='user';receipt[23]='反映済';
   const facts=memberFacts([link],[receipt],route,'user');assert.equal(facts.membership,'active');assert.equal(facts.reservationStatus,'received');assert.ok(!JSON.stringify(facts).includes('private child'));
   assert.equal(memberFacts([link,link],[receipt],route,'user').membership,'unknown');
   let calls=0;assert.equal((await readCurrentFacts({},route,'user',()=>{calls++;})).sourceState,'unavailable');assert.equal(calls,0);

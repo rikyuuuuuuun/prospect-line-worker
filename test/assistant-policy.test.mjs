@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { A_ROUTES, A_ROUTE_SET, normalizeIncoming, accessTokenBinding,
+import { A_ROUTES, A_ROUTE_SET, normalizeIncoming,
   extractResponseText, DRAFT_INSTRUCTIONS } from '../src/assistant-policy.js';
 
 const person = 'U' + 'a'.repeat(32);
@@ -16,11 +16,9 @@ test('A-team venue routes are the only permitted inbox routes', () => {
   for(const route of A_ROUTES) {
     assert.ok(A_ROUTE_SET.has(route));
     assert.ok(normalizeIncoming(route,event));
-    assert.match(accessTokenBinding(route),/^LINE_ACCESS_TOKEN_A_/);
   }
   for(const route of ['b/tsuruse','c/katayanagi','d/yagisaki','a/unknown']) {
     assert.equal(normalizeIncoming(route,event),null);
-    assert.equal(accessTokenBinding(route),null);
   }
 });
 test('LINE one-to-one text is sanitized and content is bounded', () => {

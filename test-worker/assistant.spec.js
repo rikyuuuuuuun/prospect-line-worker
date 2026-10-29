@@ -25,7 +25,7 @@ it('copying is separate from confirmation and never sends',async () => {
   await obj.receive([row]);
   expect((await obj.generate(row.id)).ok).toBe(true);
   const generated=(await obj.list()).messages[0];
-  expect((await obj.copied({id:row.id,versionId:generated.meta.versionId})).sent).toBe(false);
+  expect((await obj.copied({id:row.id,versionId:generated.meta.versionId,text:generated.draft,noMakeup:true,noFollowup:true,factsChecked:true,reviewedMessageIds:[]})).sent).toBe(false);
   expect((await obj.feedbackList()).feedback).toHaveLength(0);
   // Test an approved model draft without calling the external model.
   // The assistant UI cannot send a message that is still unreviewed.
