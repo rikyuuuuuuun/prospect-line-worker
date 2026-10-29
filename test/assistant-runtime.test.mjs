@@ -12,9 +12,9 @@ before(async()=>{
   // Test-only entrypoint exercises DO alarms and incoming events; never shipped to production.
   await build({stdin:{contents:`import {DurableObject} from 'cloudflare:workers';import {AssistantInbox as BaseInbox,assistantRequest} from './src/assistant.js';export class AssistantInbox extends BaseInbox{async runAlarmForTest(){return super.alarm()}};export class AvailabilitySnapshot extends DurableObject{async getTrialConfig(){return JSON.parse(this.env.FIXTURE_SNAPSHOT)}};export default {async fetch(request,env,ctx){const p=new URL(request.url).pathname;if(p.startsWith('/fixture/')){if(request.headers.get('authorization')!=='Bearer '+env.ASSISTANT_ADMIN_TOKEN)return new Response('',{status:401});const inbox=ctx.exports.AssistantInbox.getByName('prospect-a-team-inbox-v1');const body=await request.json();if(p==='/fixture/receive')return Response.json(await inbox.receive(body.rows));if(p==='/fixture/message')return Response.json(await inbox.message(body.id));if(p==='/fixture/alarm'){await inbox.runAlarmForTest();return Response.json({ok:true});}if(p==='/fixture/expire')return Response.json(await inbox.expireRaw(body.now));}return assistantRequest(request,env,ctx)}};`,resolveDir:process.cwd(),sourcefile:'test-fixture.mjs'},bundle:true,format:'esm',platform:'neutral',external:['cloudflare:workers'],outfile:file});
   const manifest={mainModule:'worker.mjs',modulesRoot:dir,modules:{'worker.mjs':{type:'esm',contents:await readFile(file,'utf8')}}};
-  const worker=(name,values,reply)=>({config:{type:'worker',name,compatibilityDate:'2026-08-12',manifest,exports:{AssistantInbox:{type:'durable-object',storage:'sqlite'},AvailabilitySnapshot:{type:'durable-object',storage:'sqlite'}},env:Object.fromEntries(Object.entries({ASSISTANT_ENABLED:'true',ASSISTANT_ADMIN_TOKEN:token,FIXTURE_SNAPSHOT:JSON.stringify(snapshot),...values}).map(([k,value])=>[k,{type:'text',value}]))},dev:{outboundService:{type:'fetcher',handler:async request=>{assert.equal(request.url,'https://api.openai.com/v1/responses');const body=await request.json();calls.push({worker:name,body,input:JSON.parse(body.input)});assert.equal(body.service_tier,'default');return new Response(JSON.stringify({status:'completed',usage:{total_tokens:80},output:[{content:[{type:'output_text',text:JSON.stringify({reply,checks:reply?[]:['方針により返信を作成しません'],templateIds:[]})}]}]}),{headers:{'content-type':'application/json'}});}}}});
-  const enabled={ASSISTANT_API_ENABLED:'true',OPENAI_API_KEY:'test-key-not-real',ASSISTANT_MODEL:'gpt-6-luna',ASSISTANT_MONTHLY_REQUEST_LIMIT:'20',ASSISTANT_MONTHLY_TOKEN_LIMIT:'100000',ASSISTANT_MONTHLY_USD_LIMIT:'2'};
-  mf=new Miniflare({workers:[worker('assistant-test',{ASSISTANT_API_ENABLED:'false'},''),worker('model-test',{...enabled,ASSISTANT_MONTHLY_REQUEST_LIMIT:'1'},'欠席分は別の日に振替できます。'),worker('context-test',enabled,'10分前にお越しください。1点確認させてください。'),worker('automatic-test',{...enabled,ASSISTANT_AUTO_DRAFT:'true'},'ご連絡ありがとうございます！'),worker('unsupported-model',{...enabled,ASSISTANT_MODEL:'not-approved'},''),worker('tiny-dollar',{...enabled,ASSISTANT_MONTHLY_USD_LIMIT:'0.000001'},''),worker('abstention-test',enabled,''),worker('retention-off',{ASSISTANT_ENABLED:'false',ASSISTANT_API_ENABLED:'false'},'')]});
+  const worker=(name,values,reply)=>({config:{type:'worker',name,compatibilityDate:'2026-08-12',manifest,exports:{AssistantInbox:{type:'durable-object',storage:'sqlite'},AvailabilitySnapshot:{type:'durable-object',storage:'sqlite'}},env:Object.fromEntries(Object.entries({ASSISTANT_ENABLED:'true',ASSISTANT_ADMIN_TOKEN:token,FIXTURE_SNAPSHOT:JSON.stringify(snapshot),...values}).map(([k,value])=>[k,{type:'text',value}]))},dev:{outboundService:{type:'fetcher',handler:async request=>{assert.equal(request.url,'https://api.openai.com/v1/responses');const body=await request.json();calls.push({worker:name,body,input:JSON.parse(body.input)});assert.equal(body.service_tier,'default');return new Response(JSON.stringify({status:'completed',usage:{total_tokens:80},output:[{content:[{type:'output_text',text:JSON.stringify(body.text.format.name==='prospect_exact_selection'?{sourceId:name==='invalid-selection'?'outside-candidates':JSON.parse(body.input).candidates[0].id,checks:[],reply:'勝手な言い換え'}:{reply,checks:reply?[]:['方針により返信を作成しません'],templateIds:[]})}]}]}),{headers:{'content-type':'application/json'}});}}}});
+  const enabled={ASSISTANT_DRAFT_MODE:'rewrite',ASSISTANT_API_ENABLED:'true',OPENAI_API_KEY:'test-key-not-real',ASSISTANT_MODEL:'gpt-6-luna',ASSISTANT_MONTHLY_REQUEST_LIMIT:'20',ASSISTANT_MONTHLY_TOKEN_LIMIT:'100000',ASSISTANT_MONTHLY_USD_LIMIT:'2'};
+  mf=new Miniflare({workers:[worker('assistant-test',{ASSISTANT_API_ENABLED:'false'},''),worker('model-test',{...enabled,ASSISTANT_MONTHLY_REQUEST_LIMIT:'1'},'欠席分は別の日に振替できます。'),worker('context-test',enabled,'10分前にお越しください。1点確認させてください。'),worker('automatic-test',{...enabled,ASSISTANT_AUTO_DRAFT:'true'},'ご連絡ありがとうございます！'),worker('unsupported-model',{...enabled,ASSISTANT_MODEL:'not-approved'},''),worker('tiny-dollar',{...enabled,ASSISTANT_MONTHLY_USD_LIMIT:'0.000001'},''),worker('abstention-test',enabled,''),worker('exact-test',{...enabled,ASSISTANT_DRAFT_MODE:'history_exact'},''),worker('invalid-selection',{...enabled,ASSISTANT_DRAFT_MODE:'history_exact'},''),worker('retention-off',{ASSISTANT_ENABLED:'false',ASSISTANT_API_ENABLED:'false'},'')]});
   await mf.ready;modelWorker=await mf.getWorker('model-test');contextWorker=await mf.getWorker('context-test');autoWorker=await mf.getWorker('automatic-test');
 });
 after(async()=>{if(mf)await mf.dispose();if(dir){const target=resolve(dir);assert.ok(target.startsWith(resolve(tmpdir())+sep)&&basename(target).startsWith('prospect-assistant-test-'));await rm(target,{recursive:true,force:true});}});
@@ -109,4 +109,45 @@ test('model abstention preserves its checks and cannot be copied as a reply',asy
   const m=(await api('messages',undefined,target)).messages.find(x=>x.id===q.id);
   assert.equal(m.status,'draft_review');assert.equal(m.draft,'');assert.ok(m.meta.inspection.some(i=>i.code==='abstained'));assert.ok(m.meta.checks.includes('方針により返信を作成しません'));
   assert.equal((await api('copied',review(m),target)).ok,false);
+});
+
+async function exactCase(target,inquiry,reply){await api('import',{rows:[{route,inquiry,reply,author:'owner'}]},target);const c=(await api('messages',undefined,target)).cases.find(c=>c.reply===reply);assert.ok(c);await api('case-review',{caseId:c.id,status:'approved',privacyReviewed:true},target);return c;}
+test('default exact workflow uses stored wording locally and separates manual edits',async()=>{
+  const target=await mf.getWorker('exact-test'),reply='承知いたしました！\nお大事になさってください！';
+  await exactCase(target,'体調不良で本日欠席します',reply);
+  const q=await api('manual',{route,text:'氏名：秘密太郎\n体調不良で本日お休みします'},target);await api('redraft',{id:q.id},target);
+  const m=(await api('messages',undefined,target)).messages.find(m=>m.id===q.id);
+  assert.equal(m.draft,reply);assert.equal(m.meta.exact.aiUsed,false);assert.equal(calls.filter(c=>c.worker==='exact-test').length,0);
+  assert.equal((await api('copied',review(m),target)).sent,false);
+  assert.equal((await api('copied',review(m,'手動で書き直した文です'),target)).code,'exact_wording_changed');
+  assert.equal((await api('copied',{...review(m,'手動で書き直した文です'),manualEdit:true},target)).ok,true);
+});
+test('exact fact confirmation is required even if the generic fact checkbox is checked',async()=>{
+  const target=await mf.getWorker('exact-test'),reply='こんにちは！\n退会の件、承知致しました😊\nこちらでお手続きは完了となります👏';
+  await exactCase(target,'退会を希望します',reply);const q=await api('manual',{route,text:'退会します'},target);await api('redraft',{id:q.id},target);
+  let m=(await api('messages',undefined,target)).messages.find(m=>m.id===q.id);assert.equal(m.draft,reply);
+  assert.equal((await api('copied',review(m),target)).code,'exact_confirmation_required');
+  assert.equal((await api('exact-render',{id:q.id,versionId:'old',sourceId:m.meta.exact.sourceId,values:{},confirmedClaims:['withdrawal_completed']},target)).code,'stale_draft');
+  await api('exact-render',{id:q.id,versionId:m.meta.versionId,sourceId:m.meta.exact.sourceId,values:{},confirmedClaims:['withdrawal_completed']},target);
+  m=(await api('messages',undefined,target)).messages.find(m=>m.id===q.id);assert.equal(m.draft,reply);assert.equal(m.meta.exact.claims[0].source,'operator');assert.equal((await api('copied',review(m),target)).ok,true);
+});
+test('missing history does not invent a new response or let edited text bypass the gate',async()=>{
+  const target=await mf.getWorker('exact-test'),q=await api('manual',{route,text:'保険の内容について教えてください'},target);await api('redraft',{id:q.id},target);
+  const m=(await api('messages',undefined,target)).messages.find(m=>m.id===q.id);assert.equal(m.draft,'');assert.equal(m.meta.exact.sourceId,'');
+  assert.equal((await api('copied',{...review(m,'新しい回答を作りました'),manualEdit:true},target)).code,'exact_confirmation_required');
+});
+test('AI can select a stored source but its invented reply never becomes the draft',async()=>{
+  const target=await mf.getWorker('exact-test');await exactCase(target,'今日は風邪で休みます','承知致しました！\nゆっくりお休みください！');
+  const q=await api('manual',{route,text:'氏名：秘密太郎\n体調不良で本日お休みします'},target);await api('redraft',{id:q.id},target);
+  const m=(await api('messages',undefined,target)).messages.find(m=>m.id===q.id),call=calls.find(c=>c.worker==='exact-test');
+  assert.equal(m.meta.exact.aiUsed,true);assert.equal(m.draft,m.meta.exact.sourceBody);assert.ok(!m.draft.includes('勝手な言い換え'));assert.ok(!JSON.stringify(call.body).includes('秘密太郎'));
+  assert.equal(call.body.text.format.name,'prospect_exact_selection');assert.ok(!Object.hasOwn(call.body.text.format.schema.properties,'reply'));
+  await api('case-review',{caseId:m.meta.exact.sourceId,status:'excluded'},target);assert.equal((await api('copied',review(m),target)).ok,false);
+});
+
+
+test('an ID outside the supplied exact candidates is rejected before showing a draft',async()=>{
+ const w=await mf.getWorker('invalid-selection');await exactCase(w,'体調不良でお休みします','承知いたしました！');await exactCase(w,'熱で欠席します','お大事になさってください！');
+ const q=await api('manual',{route,text:'体調不良で欠席します'},w);assert.equal((await api('redraft',{id:q.id},w)).code,'invalid_selection');
+ const m=(await api('messages',undefined,w)).messages.find(x=>x.id===q.id);assert.equal(m.status,'draft_failed');assert.equal(m.draft,'');
 });

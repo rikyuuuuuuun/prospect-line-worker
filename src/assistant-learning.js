@@ -1,7 +1,8 @@
 import { A_ROUTE_SET, labelForRoute } from './assistant-policy.js';
 import { redactText, privacyWarnings } from './assistant-privacy.js';
+import {compileExactReply} from './assistant-exact.js';
 
-export const POLICY_VERSION = '2026-10-29';
+export const POLICY_VERSION = '2026-10-30-history-exact';
 export const CATEGORIES = ['体験申し込み','体験日時変更','欠席','退会','会費','活動予定','その他'];
 export function classify(text) {
   if (/体験/.test(text) && /変更|(?:日程|体験日|日)を変|別の日|キャンセル|行けなく|参加できなく|欠席/.test(text)) return CATEGORIES[1];
@@ -80,8 +81,8 @@ export function skeleton(reply) {
 export function proposeTemplates(cases) {
   const groups=new Map();
   for(const c of cases.filter(c=>c.status==='approved'&&c.author==='owner'&&c.privacyReviewed)) {
-    const body=skeleton(c.reply),key=c.route+c.category+body;
-    const t=groups.get(key)||{id:crypto.randomUUID(),route:c.route,category:c.category,body,status:'pending',privacyReviewed:false,caseIds:[],version:1};
+    const exact=compileExactReply(c.reply),body=exact.body,key=c.route+c.category+body;
+    const t=groups.get(key)||{id:crypto.randomUUID(),route:c.route,category:c.category,body,slots:exact.slots,status:'pending',privacyReviewed:false,caseIds:[],version:1};
     t.caseIds.push(c.id);groups.set(key,t);
   }return [...groups.values()];
 }
@@ -112,10 +113,10 @@ export function styleProfile(cases){
   return {...profile,phrases:[...new Set(forms)].slice(0,8),guide};
 }
 export function correctionSuggestions(feedback) {
-  const groups=new Map();for(const f of feedback.filter(f=>f.status==='active'&&f.author==='owner'&&f.final!==f.draft)) {const key=f.route+'\n'+f.category+'\n'+skeleton(f.final);const g=groups.get(key)||{route:f.route,category:f.category,body:skeleton(f.final),count:0,feedbackIds:[]};g.count++;g.feedbackIds.push(f.id);groups.set(key,g);}
+  const groups=new Map();for(const f of feedback.filter(f=>f.status==='active'&&f.author==='owner'&&f.final!==f.draft)) {const exact=compileExactReply(f.final),key=f.route+'\n'+f.category+'\n'+exact.body;const g=groups.get(key)||{route:f.route,category:f.category,body:exact.body,slots:exact.slots,count:0,feedbackIds:[]};g.count++;g.feedbackIds.push(f.id);groups.set(key,g);}
   return [...groups.values()].filter(g=>g.count>=2);
 }
-export const RULES = ['欠席時の振替制度はありません。振替を提案しない。','体験後の未入会者への営業フォロー連絡は行わない。','正本の最新の確認済みデータを優先する。履歴は文体参考のみで、過去の日付・会費・会場案内・完了状態を転記しない。','受付と申込完了とキャンセル待ちを区別する。変更・退会手続きは、このシステムでは実行されない。','LINE送信機能はない。確認して手動送信するための案だけ作る。'];
+export const RULES = ['欠席時の振替制度はありません。振替を提案しない。','体験後の未入会者への営業フォロー連絡は行わない。','承認済みの過去文面をそのまま使い、日程等の可変部分だけを確認済みの値に差し替える。過去の日付・会費・会場案内・完了状態を現在の事実とみなさない。','受付と申込完了とキャンセル待ちを区別する。変更・退会手続きは、このシステムでは実行されない。','LINE送信機能はない。確認して手動送信するための案だけ作る。'];
 // Only locally derived intent features leave the Worker by default, never raw conversations.
 export function intentFeatures(text) {return {category:classify(text),illness:/体調|熱|病|風邪/.test(text),makeupRequested:/振替/.test(text),waitlist:/キャンセル待ち/.test(text),cancel:/キャンセル/.test(text)};}
 // Fixed-vocabulary summaries preserve common questions without transmitting any free-text segment.

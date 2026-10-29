@@ -1,12 +1,13 @@
 import {DurableObject} from 'cloudflare:workers';
 import {A_ROUTE_SET,normalizeIncoming,extractResponseText} from './assistant-policy.js';
-import {MODEL_PRICES as PRICES,buildDraftRequest} from './assistant-model.js';
+import {MODEL_PRICES as PRICES,buildDraftRequest,buildExactSelectionRequest} from './assistant-model.js';
+import {exactCandidates,renderExactReply} from './assistant-exact.js';
 import {assistantHtml,assistantClientJs} from './assistant-ui.js';
 import {CATEGORIES,classify,normalizeCase,csvCases,proposeTemplates,retrieve,styleProfile,correctionSuggestions,buildModelInput,inspectReply,policyWarnings,typedClaims,RULES,POLICY_VERSION,intentFeatures,deriveSafeInquiry} from './assistant-learning.js';
 import {redactText,privacyWarnings,digestText,budgetMonth,RAW_RETENTION_DAYS} from './assistant-privacy.js';
 import {readCurrentFacts,readAvailabilityFacts} from './assistant-sources.js';
 const TERMINAL=['sent','sent_confirmed','ignored','expired','send_unknown'];
-const reference=c=>JSON.stringify([c.route,c.category,c.author,c.status,c.privacyReviewed,c.inquiry,c.reply,c.body]);
+const reference=c=>JSON.stringify([c.route,c.category,c.author,c.status,c.privacyReviewed,c.inquiry,c.reply,c.body,c.slots,c.usage]);
 export class AssistantInbox extends DurableObject {
   constructor(ctx,env){super(ctx,env);this.sql=ctx.storage.sql;
     this.sql.exec("CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,route TEXT NOT NULL,user_id TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,received_at INTEGER NOT NULL,status TEXT NOT NULL,draft TEXT NOT NULL DEFAULT '',modified_at INTEGER NOT NULL,reply_key TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '')");
@@ -88,7 +89,41 @@ export class AssistantInbox extends DurableObject {
     b.tokensReserved-=reservation.tokens-total;b.reservedMicros-=reservation.micros-micros;b.actualTokens+=total;this.put('budget',b);
   }
   referencesValid(meta){return Object.entries(meta?.references||{}).every(([id,value])=>{const r=this.record(id);return r&&reference(r)===value;});}
+  async generateExact(id,{automatic=false,selection}={}){
+    this.expireRaw();const row=this.message(id);if(!row||row.kind!=='text'||TERMINAL.includes(row.status)||row.status==='drafting')return {ok:false,code:'not_redraftable'};
+    if(automatic){const day=new Date(Date.now()+9*3600000).toISOString().slice(0,10),key='auto:'+day+':'+await digestText(row.route+row.user_id),count=this.record(key)?.count||0;if(count>=Number(this.env.ASSISTANT_DAILY_CONTACT_LIMIT||3))return {ok:false,code:'contact_daily_limit'};this.put('throttle',{id:key,count:count+1,createdAt:Date.now()});}
+    this.sql.exec("UPDATE messages SET status='drafting',modified_at=? WHERE id=?",Date.now(),id);await this.schedule(150000);
+    try{
+      const [member,availability]=await Promise.all([readCurrentFacts(this.env,row.route,row.user_id),readAvailabilityFacts(this.ctx,this.env,row.route)]);
+      const facts={...member,...availability,checks:[...member.checks,...availability.checks]},cases=this.records('case'),templates=this.records('template');
+      let reviewed=this.record('input:'+id);row.category=classify(row.body);row.procedureContextConfirmed=reviewed?.procedureContextConfirmed===true;
+      const candidates=exactCandidates(row,retrieve(row.body,row.route,cases),templates),references=Object.fromEntries(candidates.map(c=>[c.id,reference(this.record(c.id))]));
+      let sourceId=selection?.sourceId||'',checks=[],aiUsed=false;
+      if(!sourceId&&candidates.length===1)sourceId=candidates[0].id;
+      else if(!sourceId&&candidates.length>1&&this.env.ASSISTANT_API_ENABLED==='true'){
+        const bodyHash=await digestText(row.body);
+        if(!reviewed?.safeForModel||reviewed.bodyHash!==bodyHash){const summary=deriveSafeInquiry(row.body);if(!summary){this.sql.exec("UPDATE messages SET status='privacy_review',error='候補選択に使う匿名本文を確認してください' WHERE id=?",id);return {ok:false,code:'privacy_review_required'};}reviewed=this.put('input',{id:'input:'+id,messageId:id,bodyHash,text:summary,safeForModel:true,privacyReviewed:false,autoDerived:true,reviewedAt:Date.now(),createdAt:Date.now()});}
+        if(!this.env.OPENAI_API_KEY||!this.env.ASSISTANT_MODEL)throw Error('api_not_configured');
+        const payload=buildExactSelectionRequest({inquiry:reviewed.text,category:row.category,candidates:candidates.map(c=>({id:c.id,body:c.body,requiredClaims:c.requiredClaims}))},this.env.ASSISTANT_MODEL);
+        const reservation=this.reserveBudget(new TextEncoder().encode(JSON.stringify(payload)).length+512,this.env.ASSISTANT_MODEL);
+        const response=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{authorization:'Bearer '+this.env.OPENAI_API_KEY,'content-type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(45000)});
+        if(!response.ok){await response.body?.cancel();throw Error('model_request_failed');}const result=await response.json();this.settleBudget(reservation,result.usage);if(result.status!=='completed')throw Error('model_incomplete');
+        const data=JSON.parse(extractResponseText(result));if(typeof data.sourceId!=='string'||!Array.isArray(data.checks)||data.sourceId&&!candidates.some(c=>c.id===data.sourceId))throw Error('invalid_selection');sourceId=data.sourceId;checks=data.checks.map(String).slice(0,12);aiUsed=true;
+      }
+      if(sourceId&&!candidates.some(c=>c.id===sourceId))throw Error('exact_source_not_available');
+      const selected=candidates.find(c=>c.id===sourceId);
+      const exact=selected?renderExactReply(selected,facts,selection||{},row.body):{reply:'',fields:[],claims:[],values:{},sourceId:'',blocking:[{code:'exact_reference_missing',message:candidates.length?'使用する過去文面を選択してください':'この用件に合う承認済みの過去文面がありません。履歴・テンプレートを追加してください',severity:'block'}]};
+      exact.candidates=candidates.map(c=>({id:c.id,label:c.label,kind:c.kind}));exact.aiUsed=aiUsed;
+      const inspection=[...inspectReply(exact.reply,facts,{category:row.category}),...exact.blocking];checks.push(...facts.checks,...inspection.map(i=>i.message),'過去の文面を保持し、差し込み以外の言い換えはしていません');
+      if(this.message(id)?.status!=='drafting')return {ok:false,code:'generation_cancelled'};if(!this.referencesValid({references})||aiUsed&&this.record(reviewed.id)?.reviewedAt!==reviewed.reviewedAt)throw Error('knowledge_changed');
+      const versionId=crypto.randomUUID(),meta={id:'meta:'+id,schemaVersion:2,messageId:id,versionId,generator:aiUsed?'openai_selection':'history_exact',draftMode:'history_exact',inputMode:aiUsed?'anonymous_selection':'local_exact',facts,exact,inspection,checks:[...new Set(checks)],caseIds:candidates.filter(c=>c.kind==='case').map(c=>c.id),templateIds:candidates.filter(c=>c.kind==='template').map(c=>c.id),usedTemplateIds:selected?.kind==='template'?[selected.id]:[],references,policyVersion:POLICY_VERSION,guardBlocked:inspection.some(i=>i.severity==='block'),createdAt:Date.now()};
+      this.put('draft-version',{...meta,id:versionId,draft:exact.reply,rawDraft:exact.reply});this.put('message-meta',meta);
+      this.sql.exec('UPDATE messages SET status=?,draft=?,error=?,modified_at=? WHERE id=?',inspection.length?'draft_review':'draft_ready',exact.reply,'',Date.now(),id);return {ok:true,generator:meta.generator,needsReview:!!inspection.length,checks:meta.checks};
+    }catch(e){const code=/^[a-z_]+$/.test(e.message)?e.message:'draft_failed';if(this.message(id)?.status==='drafting')this.sql.exec("UPDATE messages SET status='draft_failed',error=?,modified_at=? WHERE id=?",code,Date.now(),id);return {ok:false,code};}
+  }
+  async updateExact(p){const meta=this.record('meta:'+p.id);if(!meta?.exact||meta.versionId!==p.versionId||!this.referencesValid(meta))throw Error('stale_draft');if(!p.values||typeof p.values!=='object'||Array.isArray(p.values)||!Array.isArray(p.confirmedClaims)||p.confirmedClaims.some(x=>!meta.exact.claims.some(c=>c.id===x)))throw Error('invalid_exact_confirmation');return this.generateExact(p.id,{selection:p});}
   async generate(id,{automatic=false}={}){
+    if(this.env.ASSISTANT_DRAFT_MODE!=='rewrite')return this.generateExact(id,{automatic});
     this.expireRaw();const row=this.message(id);if(!row||row.kind!=='text'||TERMINAL.includes(row.status)||row.status==='drafting')return {ok:false,code:'not_redraftable'};
     let reviewed=this.record('input:'+id);const bodyHash=await digestText(row.body);
     if(this.env.ASSISTANT_API_ENABLED==='true'&&(!reviewed?.safeForModel||reviewed.bodyHash!==bodyHash)){
@@ -165,10 +200,10 @@ export class AssistantInbox extends DurableObject {
     for(const r of rows){if(this.records('template').some(t=>t.body===r.body&&t.route===r.route))continue;this.put('template',{id:crypto.randomUUID(),route:r.route,category:CATEGORIES.includes(r.category)?r.category:classify(r.title),body:r.body,title:String(r.title||'既存定型文').slice(0,80),source:String(r.source||'LINE定型文').slice(0,300),status:'pending',privacyReviewed:false,caseIds:[],version:1,createdAt:Date.now()});inserted++;}await this.scheduleRetention();return {ok:true,inserted};}
   async copied(p){const row=this.message(p.id),meta=this.record('meta:'+p.id);if(!row||!['draft_ready','draft_review','copied'].includes(row.status)||meta?.schemaVersion!==2||p.versionId!==meta.versionId||!this.referencesValid(meta))throw Error('stale_draft');
     const newer=this.newer(row);if(newer.some(m=>!Array.isArray(p.reviewedMessageIds)||!p.reviewedMessageIds.includes(m.id)))return {ok:false,code:'newer_message_requires_review',newerMessages:newer};
-    if(!p.noMakeup||!p.noFollowup||!p.factsChecked)throw Error('reply_review_required');if(typeof p.text!=='string'||!p.text.trim()||p.text.length>4000)throw Error('invalid_reply');
+    if(this.env.ASSISTANT_DRAFT_MODE!=='rewrite'&&!meta.exact)return {ok:false,code:'exact_regeneration_required'};if(meta.exact?.blocking?.length)return {ok:false,code:'exact_confirmation_required',inspection:meta.exact.blocking};if(meta.exact&&p.text!==row.draft&&p.manualEdit!==true)return {ok:false,code:'exact_wording_changed'};if(!p.noMakeup||!p.noFollowup||!p.factsChecked)throw Error('reply_review_required');if(typeof p.text!=='string'||!p.text.trim()||p.text.length>4000)throw Error('invalid_reply');
     const inspection=inspectReply(p.text,meta.facts,{category:classify(row.body)});if(inspection.some(i=>i.severity==='block'))return {ok:false,code:'policy_edit_required',inspection};
     this.sql.exec("UPDATE messages SET status='copied',modified_at=? WHERE id=?",Date.now(),p.id);
-    this.put('copy-review',{id:'copy:'+p.id,messageId:p.id,versionId:p.versionId,textHash:await digestText(p.text),reviewedMessageIds:newer.map(m=>m.id),createdAt:Date.now()});return {ok:true,text:p.text,sent:false,inspection};
+    this.put('copy-review',{id:'copy:'+p.id,messageId:p.id,versionId:p.versionId,textHash:await digestText(p.text),manualEdit:p.manualEdit===true,reviewedMessageIds:newer.map(m=>m.id),createdAt:Date.now()});return {ok:true,text:p.text,sent:false,inspection};
   }
   async confirmSent(p){const row=this.message(p.id),version=this.record(p.versionId),sent=Date.parse(p.sentAt);
     if(!row||!version||version.messageId!==p.id||version.status==='expired'||p.confirmed!==true||!String(p.text||'').trim()||p.text.length>4000||!Number.isFinite(sent)||sent<Math.floor(row.received_at/60000)*60000||sent>Date.now()+60000||['sent','sent_confirmed'].includes(row.status))throw Error('invalid_sent_confirmation');
@@ -177,7 +212,7 @@ export class AssistantInbox extends DurableObject {
     this.put('feedback',f);const c=normalizeCase({route:row.route,inquiry:row.body,reply:f.final,author,authorshipBasis:f.authorshipBasis,evidence:f.evidence,sentAt:p.sentAt,source:'feedback:'+f.id});this.put('case',c);this.sql.exec("UPDATE messages SET status='sent_confirmed',modified_at=? WHERE id=?",Date.now(),p.id);return {ok:true,evidence:f.evidence,caseId:c.id};
   }
   async revokeFeedback(p){const f=this.record(p.feedbackId);if(!f||!this.records('feedback').some(x=>x.id===f.id))throw Error('feedback_not_found');f.status='revoked';this.put('feedback',f);for(const c of this.records('case').filter(c=>c.source==='feedback:'+f.id))await this.reviewCase({caseId:c.id,status:'excluded'});return {ok:true};}
-  async suggest(p){const s=correctionSuggestions(this.records('feedback')).find(s=>s.feedbackIds.includes(p.feedbackId));if(!s)throw Error('suggestion_not_found');const sources=this.records('case').filter(c=>s.feedbackIds.some(id=>c.source==='feedback:'+id));if(!sources.length)throw Error('source_missing');this.put('template',{id:crypto.randomUUID(),route:s.route,category:s.category,body:s.body,status:'pending',privacyReviewed:false,caseIds:sources.map(c=>c.id),version:1,createdAt:Date.now()});return {ok:true};}
+  async suggest(p){const s=correctionSuggestions(this.records('feedback')).find(s=>s.feedbackIds.includes(p.feedbackId));if(!s)throw Error('suggestion_not_found');const sources=this.records('case').filter(c=>s.feedbackIds.some(id=>c.source==='feedback:'+id));if(!sources.length)throw Error('source_missing');this.put('template',{id:crypto.randomUUID(),route:s.route,category:s.category,body:s.body,slots:s.slots,status:'pending',privacyReviewed:false,caseIds:sources.map(c=>c.id),version:1,createdAt:Date.now()});return {ok:true};}
   async feedbackList(){this.expireRaw();return {ok:true,feedback:this.records('feedback'),versions:this.records('draft-version')};}
   async dismiss(id){if(!this.message(id))return {ok:false,code:'not_found'};this.sql.exec("UPDATE messages SET status='ignored',modified_at=? WHERE id=?",Date.now(),id);return {ok:true};}
   async manual(p){if(!A_ROUTE_SET.has(p.route)||!String(p.text||'').trim()||p.text.length>4000)throw Error('invalid_message');const id=p.route+':manual-'+crypto.randomUUID();await this.receive([{id,route:p.route,userId:'manual-'+crypto.randomUUID(),kind:'text',body:p.text,receivedAt:Date.now(),status:'new'}]);return {ok:true,id};}
@@ -193,7 +228,7 @@ export async function assistantRequest(request,env,ctx){const url=new URL(reques
   if(!await authorized(request,env))return out({ok:false,code:'unauthorized'},401);if(request.method==='POST'&&request.headers.get('origin')&&request.headers.get('origin')!==url.origin)return out({ok:false,code:'origin_rejected'},403);
   const inbox=ctx?.exports?.AssistantInbox?.getByName('prospect-a-team-inbox-v1',{locationHint:'apac'});if(!inbox)return out({ok:false,code:'inbox_not_configured'},503);
   if(request.method==='GET'&&path==='/assistant/api/messages')return out(await inbox.list({offset:url.searchParams.get('offset')}));if(request.method==='GET'&&path==='/assistant/api/feedback')return out(await inbox.feedbackList());if(request.method!=='POST')return out({ok:false,code:'not_found'},404);
-  const actions={'import':p=>inbox.importCases(p),'import-templates':p=>inbox.importTemplates(p),'suggest':p=>inbox.suggest(p),'case-review':p=>inbox.reviewCase(p),'extract':()=>inbox.extract(),'template':p=>inbox.template(p),'input-preview':p=>inbox.previewInput(p),'input-approve':p=>inbox.approveInput(p),'copied':p=>inbox.copied(p),'confirm-sent':p=>inbox.confirmSent(p),'feedback-revoke':p=>inbox.revokeFeedback(p),'dismiss':p=>inbox.dismiss(p.id),'manual':p=>inbox.manual(p),'redraft':p=>inbox.generate(p.id)};
+  const actions={'import':p=>inbox.importCases(p),'import-templates':p=>inbox.importTemplates(p),'suggest':p=>inbox.suggest(p),'case-review':p=>inbox.reviewCase(p),'extract':()=>inbox.extract(),'template':p=>inbox.template(p),'input-preview':p=>inbox.previewInput(p),'input-approve':p=>inbox.approveInput(p),'copied':p=>inbox.copied(p),'confirm-sent':p=>inbox.confirmSent(p),'feedback-revoke':p=>inbox.revokeFeedback(p),'dismiss':p=>inbox.dismiss(p.id),'manual':p=>inbox.manual(p),'redraft':p=>inbox.generate(p.id),'exact-render':p=>inbox.updateExact(p)};
   const key=path.slice('/assistant/api/'.length);if(!path.startsWith('/assistant/api/')||!Object.hasOwn(actions,key))return out({ok:false,code:'not_found'},404);
   try{return out(await actions[key](await boundedJson(request)));}catch(e){return out({ok:false,code:/^[a-z_]+$/.test(e.message)?e.message:'invalid_request'},e.message==='too_large'?413:400);}
 }
