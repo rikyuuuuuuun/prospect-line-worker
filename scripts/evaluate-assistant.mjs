@@ -24,7 +24,7 @@ export function validatePlan(plan){
   }
   return plan;
 }
-export function textMetrics(text){return {length:[...text].length,lines:text.split('\n').length,exclamations:(text.match(/！|!/g)||[]).length,emoji:(text.match(/\p{Extended_Pictographic}/gu)||[]).length,greeting:/^(?:こんにちは|こんばんは|おはようございます)/.test(text),acknowledgement:/承知(?:いた|致)しました/.test(text)};}
+export function textMetrics(text){return {length:[...text].length,lines:text.split('\n').length,exclamations:(text.match(/！|!/g)||[]).length,emoji:[...new Intl.Segmenter('ja',{granularity:'grapheme'}).segment(text)].filter(s=>/\p{Extended_Pictographic}/u.test(s.segment)).length,greeting:/^(?:こんにちは|こんばんは|おはようございます)/.test(text),acknowledgement:/承知(?:いた|致)しました/.test(text)};}
 function editRatio(a,b){const x=[...a],y=[...b];let prev=Array.from({length:y.length+1},(_,i)=>i);for(let i=1;i<=x.length;i++){const next=[i];for(let j=1;j<=y.length;j++)next[j]=Math.min(next[j-1]+1,prev[j]+1,prev[j-1]+(x[i-1]===y[j-1]?0:1));prev=next;}return Number((prev[y.length]/Math.max(1,x.length,y.length)).toFixed(3));}
 const hash=text=>createHash('sha256').update(text).digest('hex');
 export async function evaluate(plan,output,{execute=false,fetcher=fetch,key=process.env.OPENAI_API_KEY}={}){
@@ -49,9 +49,10 @@ export async function evaluate(plan,output,{execute=false,fetcher=fetch,key=proc
       const data=await response.json(),cost=usedCost(entry.model,data.usage);
       if(cost!==null){ledger.chargedOrReservedUsd+=cost-reserved;result.estimatedUsd=cost;result.usage=data.usage;}
       if(data.status!=='completed')throw Error('evaluation_model_incomplete');
-      const parsed=JSON.parse(extractResponseText(data));if(typeof parsed.reply!=='string'||!Array.isArray(parsed.checks)||!Array.isArray(parsed.templateIds))throw Error('evaluation_output_invalid');
-      result.status='completed';result.reply=parsed.reply;result.checks=parsed.checks;result.templateIds=parsed.templateIds;
+      const parsed=JSON.parse(extractResponseText(data));if(typeof parsed.reply!=='string'||parsed.reply.length>4000||!Array.isArray(parsed.checks)||!Array.isArray(parsed.templateIds)||(!parsed.reply.trim()&&!parsed.checks.length))throw Error('evaluation_output_invalid');
+      result.status='completed';result.reply=parsed.reply;result.checks=parsed.checks.map(String).slice(0,12);result.templateIds=parsed.templateIds.filter(id=>entry.input.templates?.some(t=>t.id===id));result.abstained=!parsed.reply.trim();
       result.inspection=inspectReply(parsed.reply,entry.input.facts,{category:entry.input.intent.category});
+      if(result.abstained)result.inspection.push({code:'abstained',message:'AIが返信文の作成を見合わせました。確認事項を確認してください',severity:'block'});
       result.metrics=textMetrics(parsed.reply);if(entry.expectedReply){result.referenceMetrics=textMetrics(entry.expectedReply);result.editRatio=editRatio(entry.expectedReply,parsed.reply);}
       result.elapsedMs=Date.now()-started;result.responseModel=data.model;result.completedAt=new Date().toISOString();
       if(cost===null){result.usageUnknown=true;await save();throw Error('evaluation_usage_unknown');}

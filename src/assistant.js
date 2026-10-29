@@ -119,13 +119,13 @@ export class AssistantInbox extends DurableObject {
         const response=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{authorization:'Bearer '+this.env.OPENAI_API_KEY,'content-type':'application/json'},signal:AbortSignal.timeout(45000),body:JSON.stringify(payload)});
         if(!response.ok){await response.body?.cancel();throw Error('model_request_failed');}
         const result=await response.json();this.settleBudget(reservation,result.usage);if(result.status!=='completed')throw Error('model_incomplete');const data=JSON.parse(extractResponseText(result));
-        if(typeof data.reply!=='string'||data.reply.length>4000||!data.reply.trim()||!Array.isArray(data.checks)||!Array.isArray(data.templateIds))throw Error('invalid_model_output');
+        if(typeof data.reply!=='string'||data.reply.length>4000||!Array.isArray(data.checks)||!Array.isArray(data.templateIds)||(!data.reply.trim()&&!data.checks.length))throw Error('invalid_model_output');
         reply=data.reply;checks=data.checks.map(String).slice(0,12);usedTemplateIds=data.templateIds.filter(id=>input.templates.some(t=>t.id===id));generator='openai';
       }else{
         const ref=retrieve(row.body,row.route,cases).find(c=>classify(row.body)==='欠席'&&intentFeatures(c.inquiry).illness===intentFeatures(row.body).illness&&!inspectReply(c.reply,facts,{category:classify(row.body)}).length);
         reply=ref?ref.reply:'こんにちは！\nご連絡ありがとうございます！';checks.push('OpenAI API停止中のローカル参考文です');
       }
-      const inspection=inspectReply(reply,facts,{category:classify(row.body)});checks.push(...facts.checks,...inspection.map(x=>x.message));
+      const inspection=inspectReply(reply,facts,{category:classify(row.body)});if(!reply.trim())inspection.push({code:'abstained',message:'AIが返信文の作成を見合わせました。確認事項を確認してください',severity:'block'});checks.push(...facts.checks,...inspection.map(x=>x.message));
       if(this.message(id)?.status!=='drafting')return {ok:false,code:'generation_cancelled'};
       if(!this.referencesValid({references})||reviewed&&this.record(reviewed.id)?.reviewedAt!==reviewed.reviewedAt)throw Error('knowledge_changed');
       if(reviewed?.autoDerived)checks.push('原文を送らず定型の用件から自動要約しています。細かな条件は原文と照合してください');

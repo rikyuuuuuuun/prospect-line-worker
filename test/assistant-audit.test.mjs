@@ -1,9 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {classify,inspectReply,policyWarnings,typedClaims,csvCases,buildModelInput,skeleton,deriveSafeInquiry} from '../src/assistant-learning.js';
+import {classify,inspectReply,policyWarnings,typedClaims,csvCases,buildModelInput,skeleton,deriveSafeInquiry,styleProfile} from '../src/assistant-learning.js';
 import {redactText,budgetMonth} from '../src/assistant-privacy.js';
 import {memberFacts,readAvailabilityFacts,readCurrentFacts,sourceVenueMatches} from '../src/assistant-sources.js';
 const route='a/saitama-shibakawa';
+test('owner style guidance is drawn only from approved anonymous owner examples',()=>{
+  const own={status:'approved',privacyReviewed:true,author:'owner',reply:'こんにちは！\n承知致しました😊'};
+  const profile=styleProfile([own,{...own,author:'staff',reply:'秘密の別文体'},{...own,status:'revoked'}]);
+  assert.equal(profile.sampleCount,1);assert.ok(profile.guide.some(g=>g.includes('「！」')));assert.ok(profile.guide.some(g=>g.includes('😊')));
+  assert.ok(!JSON.stringify(profile).includes('秘密の別文体'));assert.deepEqual(styleProfile([]).guide,[]);
+  assert.equal(buildModelInput({route,body:'欠席します'},[],[],{}).channel.venue,'さいたま芝川');
+});
+test('automatic retirement summary preserves a stated month-end without copying identity',()=>{
+  const text=deriveSafeInquiry('氏名：秘密太郎\n9月末をもちまして、トランポリンを退会させていただきたいです。');
+  assert.match(text,/退会希望時期: 9月末/);assert.ok(!text.includes('秘密太郎'));
+  assert.ok(!deriveSafeInquiry('今月末か来月末に退会したいです。').includes('退会希望時期:'));
+});
+test('availability questions do not assert openings and mixed class clauses stay separate',()=>{
+  const facts={availability:{dates:[],classes:[{value:'前半',status:'waitlist'},{value:'後半',status:'open'}]}};
+  assert.ok(!inspectReply('前半クラスの体験について、最新の空き状況を確認してご案内します。',facts).some(i=>i.code==='class_status'));
+  assert.ok(!inspectReply('前半はキャンセル待ち、後半は通常受付中です。',facts).some(i=>i.code==='class_status'));
+  for(const reply of ['前半に空きがございます！','前半は空きあり','前半は体験可能となっております。','前半は受付中','後半はキャンセル待ちです。'])assert.ok(inspectReply(reply,facts).some(i=>i.code==='class_status'));
+});
 test('safe inquiry retains class selection needed to distinguish live waitlist and open classes',()=>{
   assert.match(deriveSafeInquiry('前半の体験に参加したいです。'),/クラス: 前半/);
   assert.match(deriveSafeInquiry('後半の体験を希望しています。'),/クラス: 後半/);
