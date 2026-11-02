@@ -61,6 +61,25 @@ it('the session endpoint verifies LINE once and issues a locally usable proof',a
   expect(network).toHaveBeenCalledTimes(1);
 });
 
+it.each(['チラシ','紹介','その他'])('persists discovery source %s and forwards it with all notes intact',async discoverySource=>{
+  const data=await booking();Object.assign(data,{discoverySource,referrer:discoverySource==='紹介'?'':'hidden-name',notes:'あ'.repeat(300)});
+  expect((await post('/api/reservations',data)).status).toBe(200);
+  network.mockImplementationOnce(async(_url,options)=>{
+    const saved=JSON.parse(options.body);
+    expect(saved.discoverySource).toBe(discoverySource);expect(saved.referrer).toBe('');
+    expect(saved.notes).toBe(data.notes);return Response.json({ok:true});
+  });
+  await runDurableObjectAlarm(object(data));
+  expect(network).toHaveBeenCalledTimes(1);expect((await object(data).status()).state).toBe('synced');
+});
+
+it('rejects unknown discovery sources before any durable acceptance',async()=>{
+  const data=await booking();data.discoverySource='unknown';
+  const response=await post('/api/reservations',data);
+  expect(response.status).toBe(400);expect((await response.json()).message).toBe('invalid_discovery_source');
+  expect(await object(data).status()).toBeNull();expect(network).not.toHaveBeenCalled();
+});
+
 it.each(['identity','policy','expired','closed'])('invalid %s fails before creating any durable booking',async kind=>{
   const data=await booking();
   if(kind==='identity')data.identityProof.signature='00'.repeat(32);
