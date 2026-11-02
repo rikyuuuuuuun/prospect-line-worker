@@ -691,6 +691,7 @@ async function handleReservationSubmit_(request, env, ctx) {
       className: reservation.className,
       receptionType: reservation.receptionType,
       children: reservation.children,
+      ...(reservation.discoverySource ? { discoverySource: reservation.discoverySource } : {}),
       referrer: reservation.referrer,
       notes: reservation.notes,
     });
@@ -1061,13 +1062,19 @@ function validateReservation_(body, routeKey) {
     throw new Error('invalid_experience_date');
   }
   if (receptionType === 'waitlist' && experienceDate) throw new Error('invalid_experience_date');
+  const discoverySource = safeSingleLine_(body.discoverySource, 20);
+  // Missing values remain compatible with forms opened before this release.
+  if (discoverySource && !['チラシ', '紹介', 'その他'].includes(discoverySource)) {
+    throw new Error('invalid_discovery_source');
+  }
   return {
     requestId: requestId,
     children: children,
     className: className,
     experienceDate: experienceDate,
     receptionType: receptionType,
-    referrer: safeSingleLine_(body.referrer, 80),
+    discoverySource: discoverySource,
+    referrer: !discoverySource || discoverySource === '紹介' ? safeSingleLine_(body.referrer, 80) : '',
     notes: safeMultiline_(body.notes, 300),
   };
 }
@@ -1381,7 +1388,7 @@ function reservationError_(error) {
   const code = String(error && error.message || 'reservation_error');
   const badRequestCodes = [
     'invalid_request_id', 'invalid_route', 'invalid_children', 'invalid_child_name', 'invalid_grade',
-    'invalid_class', 'invalid_reception_type', 'invalid_experience_date', 'selected_date_unavailable',
+    'invalid_class', 'invalid_reception_type', 'invalid_experience_date', 'invalid_discovery_source', 'selected_date_unavailable',
     'request_too_large', 'invalid_request', 'invalid_json', 'invalid_availability_policy',
   ];
   const unauthorizedCodes = ['invalid_line_identity', 'line_login_not_configured', 'reservation_session_expired'];
@@ -1469,7 +1476,8 @@ function buildReservationHtml_(liffId) {
       <h2 class="children-title">体験するお子さま</h2>
       <div id="childrenArea"></div>
       <button id="addChildButton" class="add-child" type="button">＋ 兄弟・姉妹を追加する</button>
-      <div class="field"><label for="referrer">紹介してくれた方</label><input id="referrer" name="referrer" maxlength="80" placeholder="知人・お友達のお名前（いなければ空欄）"></div>
+      <div class="field"><label for="discoverySource">クラブを知ったきっかけ<span class="required">必須</span></label><select id="discoverySource" name="discoverySource" required><option value="">選択してください</option><option value="チラシ">チラシ</option><option value="紹介">紹介</option><option value="その他">その他</option></select></div>
+      <div id="referrerField" class="field hidden"><label for="referrer">紹介してくれた方のお名前（任意）</label><input id="referrer" name="referrer" maxlength="80" placeholder="お名前が分かればご入力ください" disabled><div class="hint">空欄でもお申し込みいただけます。</div></div>
       <div class="field"><label for="notes">相談・連絡事項</label><textarea id="notes" name="notes" maxlength="300" placeholder="体操経験や心配なことなど（任意）"></textarea></div>
       <button id="submitButton" class="primary" type="submit" disabled>接続を確認しています…</button>
     </form>
@@ -1495,6 +1503,9 @@ function buildReservationHtml_(liffId) {
   const dateSelect=document.getElementById('experienceDate');
   const childrenArea=document.getElementById('childrenArea');
   const addChildButton=document.getElementById('addChildButton');
+  const discoverySourceSelect=document.getElementById('discoverySource');
+  const referrerField=document.getElementById('referrerField');
+  const referrerInput=document.getElementById('referrer');
   const successTitle=document.getElementById('successTitle');
   const chatStatus=document.getElementById('chatStatus');
   const retryChatButton=document.getElementById('retryChatButton');
@@ -1627,9 +1638,13 @@ function buildReservationHtml_(liffId) {
   // Only unsent input is kept in this tab for at most 30 minutes; never tokens or receipts.
   function draftKey(){return 'prospect:reservation-draft:v1:'+routeKey}
   function clearDraft(){try{sessionStorage.removeItem(draftKey())}catch(_){}}
+  function updateReferrerField(){
+    const referred=discoverySourceSelect.value==='紹介';
+    referrerField.classList.toggle('hidden',!referred);referrerInput.disabled=!referred;
+  }
   function saveDraft(){
     if(!routeKey||completed||pendingRequestId)return;
-    try{sessionStorage.setItem(draftKey(),JSON.stringify({savedAt:Date.now(),children:collectChildren(),referrer:document.getElementById('referrer').value,notes:document.getElementById('notes').value}))}catch(_){}
+    try{sessionStorage.setItem(draftKey(),JSON.stringify({savedAt:Date.now(),children:collectChildren(),discoverySource:discoverySourceSelect.value,referrer:discoverySourceSelect.value==='紹介'?referrerInput.value:'',notes:document.getElementById('notes').value}))}catch(_){}
   }
   function restoreDraft(){
     try{
@@ -1638,7 +1653,9 @@ function buildReservationHtml_(liffId) {
       if(!Number.isFinite(draft.savedAt)||draft.savedAt>Date.now()||Date.now()-draft.savedAt>1800000||!Array.isArray(draft.children)||!draft.children.length||draft.children.length>MAX_CHILDREN)return;
       childrenArea.textContent='';
       draft.children.forEach(child=>{addChild();const card=childrenArea.lastElementChild;card.querySelector('.child-name').value=String(child.name||'').slice(0,50);card.querySelector('.child-kana').value=String(child.kana||'').slice(0,50);card.querySelector('.child-grade').value=currentGrades().includes(child.grade)?child.grade:''});
-      document.getElementById('referrer').value=String(draft.referrer||'').slice(0,80);document.getElementById('notes').value=String(draft.notes||'').slice(0,300);
+      discoverySourceSelect.value=['チラシ','紹介','その他'].includes(draft.discoverySource)?draft.discoverySource:(!draft.discoverySource&&draft.referrer?'紹介':'');
+      referrerInput.value=discoverySourceSelect.value==='紹介'?String(draft.referrer||'').slice(0,80):'';
+      updateReferrerField();document.getElementById('notes').value=String(draft.notes||'').slice(0,300);
     }catch(_){clearDraft()}
   }
   function loadAvailability(){
@@ -1735,6 +1752,7 @@ function buildReservationHtml_(liffId) {
     const classLine=currentFixedClass?'活動時間：'+(fixedClassTime.textContent||selectedClassDisplay()):'希望クラス：'+selectedClassDisplay();
     const lines=waitlist?['【体験キャンセル待ちを申し込みました】','会場：'+route.venue,classLine,'空きが出ましたら、キャンセル待ちの申込順にご案内します。','空きが出るまでは体験には参加できません。','お子さま：']:['【体験予約を送信しました】','会場：'+route.venue,'体験希望日：'+(selectedDate?selectedDate.textContent:payload.experienceDate),classLine,'お子さま：'];
     payload.children.forEach(child=>lines.push('・'+child.name+(child.kana?'（'+child.kana+'）':'')+'／'+child.grade));
+    if(payload.discoverySource)lines.push('クラブを知ったきっかけ：'+payload.discoverySource);
     if(payload.referrer)lines.push('紹介してくれた方：'+payload.referrer);
     if(payload.notes)lines.push('相談・連絡事項：'+payload.notes);
     return lines.join('\\n').slice(0,4850)+'\\n受付番号：FORM-'+payload.requestId;
@@ -1800,6 +1818,7 @@ function buildReservationHtml_(liffId) {
     return selectable;
   }
   addChildButton.addEventListener('click',()=>addChild());
+  discoverySourceSelect.addEventListener('change',()=>updateReferrerField());
   classSelect.addEventListener('change',()=>{updateReceptionMode();updateSubmitState()});
   form.addEventListener('submit',async event=>{
     event.preventDefault();
@@ -1809,7 +1828,7 @@ function buildReservationHtml_(liffId) {
     }
     idToken=liff.getIDToken()||idToken;
     const receptionType=selectedClassStatus()==='waitlist'?'waitlist':'reservation';
-    const reservationData={route:routeKey,receptionType:receptionType,experienceDate:receptionType==='waitlist'?'':dateSelect.value,className:classSelect.value,children:collectChildren(),referrer:document.getElementById('referrer').value,notes:document.getElementById('notes').value};
+    const reservationData={route:routeKey,receptionType:receptionType,experienceDate:receptionType==='waitlist'?'':dateSelect.value,className:classSelect.value,children:collectChildren(),discoverySource:discoverySourceSelect.value,referrer:discoverySourceSelect.value==='紹介'?referrerInput.value:'',notes:document.getElementById('notes').value};
     const payloadKey=JSON.stringify(reservationData);
     if(!pendingRequestId||pendingPayloadKey!==payloadKey){pendingRequestId=requestId();pendingPayloadKey=payloadKey}
     clearDraft();

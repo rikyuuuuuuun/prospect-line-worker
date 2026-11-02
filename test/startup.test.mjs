@@ -186,8 +186,53 @@ test('age-verification refresh shares the initial request deadline',async()=>{
 
 function fillWaitlist(b){
   b.dom.document.querySelector('.child-name').value='検証用';b.dom.document.querySelector('.child-grade').value='1年生';
+  b.element('discoverySource').value='チラシ';b.event('discoverySource','change');
   b.element('className').value='後半';b.event('className','change');
 }
+
+test('discovery choices require a selection and show an optional referrer only for referrals',async t=>{
+  const b=browser(t);await settle();fillWaitlist(b);
+  const source=b.element('discoverySource'),referrer=b.element('referrer');
+  assert.deepEqual(Array.from(source.options,o=>o.value),['','チラシ','紹介','その他']);
+  source.value='';assert.equal(source.checkValidity(),false);
+  for(const value of ['チラシ','紹介','その他']){
+    source.value=value;b.event('discoverySource','change');
+    assert.equal(b.element('referrerField').classList.contains('hidden'),value!=='紹介');
+    assert.equal(referrer.disabled,value!=='紹介');assert.equal(referrer.required,false);
+    assert.equal(b.element('reservationForm').checkValidity(),true);
+  }
+});
+
+test('referrals restore their source and optional name, including drafts from the previous form',async t=>{
+  const storage=new Map(),b=browser(t,{storage});await settle();fillWaitlist(b);
+  b.element('discoverySource').value='紹介';b.event('discoverySource','change');
+  b.element('referrer').value='検証用紹介者';b.run('saveDraft()');
+  const next=browser(t,{storage});await settle();
+  assert.equal(next.element('discoverySource').value,'紹介');
+  assert.equal(next.element('referrer').value,'検証用紹介者');
+  assert.equal(next.element('referrer').disabled,false);
+  const key='prospect:reservation-draft:v1:'+route;
+  storage.set(key,JSON.stringify({savedAt:Date.now(),children:[{name:'検証用',grade:'1年生'}],referrer:'旧フォームの紹介者'}));
+  const legacy=browser(t,{storage});await settle();
+  assert.equal(legacy.element('discoverySource').value,'紹介');
+  assert.equal(legacy.element('referrer').value,'旧フォームの紹介者');
+});
+
+test('submission and LINE receipt retain the chosen source and exclude hidden referrer names',async t=>{
+  const b=browser(t);await settle();fillWaitlist(b);
+  b.element('discoverySource').value='紹介';b.event('discoverySource','change');
+  b.element('referrer').value='検証用紹介者';
+  b.element('discoverySource').value='その他';b.event('discoverySource','change');
+  let payload;
+  b.c.fetch=async(path,options)=>{
+    assert.equal(path,'/api/reservations');payload=JSON.parse(options.body);
+    return Response.json({ok:true,receiptId:'FORM-'+payload.requestId});
+  };
+  b.event('reservationForm','submit');await settle();
+  assert.equal(payload.discoverySource,'その他');assert.equal(payload.referrer,'');
+  assert.match(b.run('pendingChatMessage'),/クラブを知ったきっかけ：その他/);
+  assert.doesNotMatch(b.run('pendingChatMessage'),/検証用紹介者/);
+});
 test('slow receipt permission never delays durable acceptance or permits duplicate reservations',async t=>{
   const permission=deferred(),save=deferred();
   const b=browser(t,{permission:()=>permission.promise,fetch:async path=>path==='/api/reservations'?save.promise:Response.json(good())});await settle();fillWaitlist(b);
