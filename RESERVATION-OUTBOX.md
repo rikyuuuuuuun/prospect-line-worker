@@ -16,6 +16,16 @@ reservations are synced. Do not delete the namespace or roll back to a version
 which lacks this class. Fixing the forwarding configuration/backend allows the
 persisted alarm to recover without the reservation holder repeating the form.
 
+If GAS still fails on an attempt at least five minutes after acceptance, the
+outbox stores the time of that incident in the fixed diagnostic object. It stores
+no booking identifiers there. `GET /health/reservation-delivery` returns HTTP 503
+for two hours after the latest overdue failure, even if a later retry succeeds.
+This lets the hourly Production health monitor report an incident that recovered
+between checks. Look for `reservation_sync_retry` and `reservation_synced` in
+Workers Logs to confirm delivery or recovery. The monitor reads the marker only.
+It does not submit a test reservation or check the sheet before a real attempt.
+Deploy the Worker endpoint before enabling this check on the default branch.
+
 The foundation release was deployed before switching the reservation handler.
 To check the infrastructure, POST `/health/reservation-storage`, then GET it after the
 alarm runs. This uses one fixed synthetic marker, never GAS or LINE. A `synced`

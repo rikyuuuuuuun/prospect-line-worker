@@ -1,5 +1,9 @@
 import { DurableObject } from 'cloudflare:workers';
 
+const DELIVERY_DELAY_MS = 5 * 60 * 1000;
+// Longer than both the hourly monitor and the maximum retry interval.
+const DELIVERY_INCIDENT_WINDOW_MS = 2 * 60 * 60 * 1000;
+
 // One object per reservation. Never persist LINE ID tokens or forwarding secrets.
 export class ReservationOutbox extends DurableObject {
   async accept(route, payload) {
@@ -55,6 +59,14 @@ export class ReservationOutbox extends DurableObject {
       // Details from GAS may contain private information. Log only the reference.
       console.error(JSON.stringify({ event: 'reservation_sync_retry', receiptId: record.receiptId,
         objectId: this.ctx.id.toString(), route: record.route, attempts }));
+      if (Date.now() - record.acceptedAt >= DELIVERY_DELAY_MS) {
+        try {
+          const diagnostic = this.ctx.exports.ReservationOutbox.getByName('diagnostic-v1', { locationHint: 'apac' });
+          await diagnostic.recordDeliveryIncident();
+        } catch (_) {
+          console.error(JSON.stringify({ event: 'reservation_delivery_monitor_write_failed' }));
+        }
+      }
       // The already-committed next alarm survives even if this handler terminates.
     }
   }
@@ -90,6 +102,17 @@ export class ReservationOutbox extends DurableObject {
   publicProbe(record) {
     if (record && record.kind !== 'probe') throw new Error('invalid_probe');
     return { ok: true, state: record?.state || 'empty', acceptedAt: record?.acceptedAt || null, completedAt: record?.completedAt || null };
+  }
+
+  // Only the time is shared with the monitor. This key is independent of the storage probe.
+  async recordDeliveryIncident() {
+    await this.ctx.storage.put('lastDeliveryIncidentAt', Date.now());
+  }
+
+  async deliveryHealth() {
+    const lastIncidentAt = await this.ctx.storage.get('lastDeliveryIncidentAt');
+    const delayed = lastIncidentAt !== undefined && Date.now() - lastIncidentAt < DELIVERY_INCIDENT_WINDOW_MS;
+    return { ok: !delayed, state: delayed ? 'recent_delivery_failure' : 'no_recent_delivery_failure' };
   }
 
   // No public route exposes this. Operators can inspect a receipt using a
