@@ -30,3 +30,9 @@ jobs:
           body=$(curl -sS --retry 3 --retry-delay 20 --max-time 40 "$BASE_URL/health/gas")
           echo "$body" | jq -c '{ok, gasBuild, authorization, activityCalendar}' | tee -a "$GITHUB_STEP_SUMMARY"
           echo "$body" | jq -e '.ok == true' > /dev/null
+      - name: Accepted reservation delivery has no recent overdue failure
+        if: ${{ !cancelled() }}
+        run: |
+          body=$(curl -sS --retry 2 --retry-delay 5 --max-time 15 "$BASE_URL/health/reservation-delivery")
+          echo "$body" | jq -c '{ok, state}' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$body" | jq -e '.ok == true and .state == "no_recent_delivery_failure"' > /dev/null

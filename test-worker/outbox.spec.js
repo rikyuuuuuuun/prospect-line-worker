@@ -59,6 +59,39 @@ it.each([{}, { ok: false }, { ok: 'true' }])('retains the booking when GAS does 
   expect((await object.status()).state).toBe('pending');
 });
 
+it('alerts the hourly monitor after an overdue GAS rejection and keeps the incident visible after recovery', async () => {
+  const object = stub();
+  const data = payload();
+  await object.accept('test-route', data);
+  const endpoint = 'https://fixture.invalid/health/reservation-delivery';
+  network.mockImplementationOnce(async () => Response.json({ ok: false }));
+  await runDurableObjectAlarm(object);
+  expect((await exports.default.fetch(endpoint)).status).toBe(200);
+
+  await runInDurableObject(object, async (_, state) => {
+    const record = await state.storage.get('record');
+    await state.storage.put('record', { ...record, acceptedAt: Date.now() - 6 * 60 * 1000 });
+  });
+  network.mockImplementationOnce(async () => Response.json({ ok: false }));
+  await runDurableObjectAlarm(object);
+  expect((await object.status()).state).toBe('pending');
+  const response = await exports.default.fetch(endpoint);
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({ ok: false, state: 'recent_delivery_failure' });
+
+  network.mockImplementationOnce(async () => Response.json({ ok: true }));
+  await runDurableObjectAlarm(object);
+  expect((await object.status()).state).toBe('synced');
+  expect((await exports.default.fetch(endpoint)).status).toBe(503);
+
+  const diagnostic = exports.ReservationOutbox.getByName('diagnostic-v1', { locationHint: 'apac' });
+  await runInDurableObject(diagnostic, async (_, state) => {
+    expect(await state.storage.get('record')).toBeUndefined();
+    await state.storage.put('lastDeliveryIncidentAt', Date.now() - 2 * 60 * 60 * 1000);
+  });
+  expect((await exports.default.fetch(endpoint)).status).toBe(200);
+});
+
 it('rolls back the booking if the retry alarm cannot be committed', async () => {
   const object = stub();
   await runInDurableObject(object, async (instance, state) => {

@@ -109,6 +109,16 @@ export default {
       return handleGasHealth_(env);
     }
 
+    if (request.method === 'GET' && path === 'health/reservation-delivery') {
+      try {
+        const diagnostic = ctx.exports.ReservationOutbox.getByName('diagnostic-v1', { locationHint: 'apac' });
+        const result = await diagnostic.deliveryHealth();
+        return json_(result, result.ok ? 200 : 503);
+      } catch (_) {
+        return json_({ ok: false, state: 'reservation_delivery_monitor_unavailable' }, 503);
+      }
+    }
+
     if (['GET', 'POST'].includes(request.method) && path === 'health/reservation-storage') {
       // Starting a probe writes to Durable Object storage. Once HEALTH_PROBE_TOKEN is set,
       // POST requires it; GET (read-only status) stays public for uptime monitors.
