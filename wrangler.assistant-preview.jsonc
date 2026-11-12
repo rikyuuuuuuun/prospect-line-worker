@@ -1,0 +1,8 @@
+{
+  "name":"prospect-assistant-local-preview",
+  "main":"src/assistant-preview.js",
+  "compatibility_date":"2026-08-12",
+  "vars":{"ASSISTANT_ENABLED":"true","ASSISTANT_API_ENABLED":"false","ASSISTANT_ADMIN_TOKEN":"local-preview-only-not-a-production-secret"},
+  "exports":{"AssistantInbox":{"type":"durable-object","storage":"sqlite"}},
+  "dev":{"ip":"127.0.0.1","port":8788}
+}
