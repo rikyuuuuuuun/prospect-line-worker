@@ -8,6 +8,7 @@ const workerSource=await readFile(new URL('../src/worker.js',import.meta.url),'u
 const source=workerSource.replace(/^import .*;\r?$/gm,'').replace(/^export \{.*;\r?$/gm,'').replace('export default {','globalThis.worker = {');
 const legacyRoutes=[...workerSource.matchAll(/'([abcd]\/[^']+)'/g)].map(m=>m[1]);
 const eRoute='e/tsurugashima-fuji';
+const minamiRoute='e/tsurugashima-minami';
 test('E is present in the trial form without changing activity venue choices',async()=>{
   const coreSource=(await readFile(new URL('../src/index.js',import.meta.url),'utf8'))
     .replace(/^export \{ ReservationOutbox \} from .*;\r?$/m,'')
@@ -15,7 +16,9 @@ test('E is present in the trial form without changing activity venue choices',as
     .replace('export default {','globalThis.core = {');
   const c=vm.createContext({console,TextEncoder});vm.runInContext(coreSource,c);
   assert.ok(c.buildReservationHtml_('fixture').includes('"e/tsurugashima-fuji"'));
+  assert.ok(c.buildReservationHtml_('fixture').includes('"e/tsurugashima-minami"'));
   assert.equal(c.buildActivityApplicationHtml_('fixture').includes('"e/tsurugashima-fuji"'),false);
+  assert.equal(c.buildActivityApplicationHtml_('fixture').includes('"e/tsurugashima-minami"'),false);
   assert.ok(c.buildActivityApplicationHtml_('fixture').includes('"b/tsurugashima-daiichi"'));
 });
 test('E accepts nursery middle-year through junior-high third-year and keeps other venues unchanged',async()=>{
@@ -34,6 +37,10 @@ test('E accepts nursery middle-year through junior-high third-year and keeps oth
   assert.equal(config.routes[eRoute].grades.length,11);
   assert.equal(config.routes[eRoute].grades.includes('年少'),false);
   assert.equal(config.routes[eRoute].grades.at(-1),'中学3年生');
+  assert.deepEqual(config.routes[minamiRoute].grades,config.routes[eRoute].grades);
+  assert.equal(config.routes[minamiRoute].venue,'南体操&トランポリンクラブ');
+  assert.equal(c.validateReservation_(input('中学3年生'),minamiRoute).children[0].grade,'中学3年生');
+  assert.throws(()=>c.validateReservation_(input('年少'),minamiRoute),/invalid_grade/);
   assert.equal(config.routes['a/sugishita'].grades.at(-1),'6年生');
 });
 function setup() {
@@ -64,7 +71,7 @@ async function push(h,data) {
 test('old 30-venue producer stays valid and always resets E to an empty closed configuration',async()=>{
   const h=setup();assert.equal(legacyRoutes.length,30);
   assert.equal((await push(h,bundle())).status,200);
-  assert.equal(Object.keys(h.stored.byRoute).length,31);
+  assert.equal(Object.keys(h.stored.byRoute).length,32);
   assert.deepEqual(Array.from(h.stored.byRoute[eRoute].classes,c=>[c.value,c.status]),[['前半','closed'],['後半','closed']]);
   assert.deepEqual(Array.from(h.stored.byRoute[eRoute].dates),[]);
   const data=bundle();data.byRoute[eRoute]={dates:[],classes:[{value:'前半',status:'open',time:'17:00〜17:50'},{value:'後半',status:'open',time:'18:00〜18:50'}]};
@@ -73,11 +80,28 @@ test('old 30-venue producer stays valid and always resets E to an empty closed c
   assert.equal((await push(h,bundle())).status,200);
   assert.ok(h.stored.byRoute[eRoute].classes.every(c=>c.status==='closed'));
 });
+test('current GAS keeps Fuji open and clears stale Minami availability on rollback',async()=>{
+  const h=setup(),data=bundle();
+  data.byRoute[eRoute]={dates:[],classes:[{value:'前半',status:'open',time:'17:00〜17:50'}]};
+  data.byRoute[minamiRoute]={dates:[{value:'2026-11-28',label:'11月28日'}],classes:[
+    {value:'前半',status:'open',time:'13:30〜14:20'},
+    {value:'後半',status:'closed',time:'14:30〜15:20'},
+  ]};
+  assert.equal((await push(h,data)).status,200);
+  assert.deepEqual(Array.from(h.stored.byRoute[minamiRoute].classes,c=>c.time),['13:30〜14:20','14:30〜15:20']);
+
+  delete data.byRoute[minamiRoute];
+  assert.equal((await push(h,data)).status,200);
+  assert.equal(h.stored.byRoute[eRoute].classes[0].status,'open');
+  assert.deepEqual(Array.from(h.stored.byRoute[minamiRoute].dates),[]);
+  assert.deepEqual(Array.from(h.stored.byRoute[minamiRoute].classes,c=>[c.value,c.status]),[['前半','closed'],['後半','closed']]);
+});
 test('E onboarding never permits incomplete existing venues, unknown routes or malformed E settings',async()=>{
   for(const mutate of [
     d=>{delete d.byRoute['a/sugishita']},
     d=>{d.byRoute['e/unknown']={dates:[],classes:[{value:'前半',status:'open'}]}},
     d=>{d.byRoute[eRoute]={dates:[],classes:[{value:'前半',status:'invalid'}]}},
+    d=>{d.byRoute[minamiRoute]={dates:[],classes:[{value:'前半',status:'invalid'}]}},
     d=>{d.byRoute='malformed'},
   ]) {
     const h=setup(),data=bundle();mutate(data);

@@ -57,6 +57,7 @@ const ROUTES = Object.freeze({
   'd/shima': route_('LINE_SECRET_D_SHIMA', 'D', '島', '島小学校体育館'),
 
   'e/tsurugashima-fuji': route_('LINE_SECRET_E_TSURUGASHIMA_FUJI', 'E', '鶴ヶ島藤', '鶴ヶ島藤体操＆トランポリンクラブ'),
+  'e/tsurugashima-minami': route_('LINE_SECRET_E_TSURUGASHIMA_MINAMI', 'E', '鶴ヶ島南', '南体操&トランポリンクラブ'),
 });
 
 const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
@@ -81,7 +82,7 @@ const E_TEAM_GRADES = Object.freeze([
   '中学1年生', '中学2年生', '中学3年生',
 ]);
 function reservationGrades_(routeKey) {
-  return routeKey === 'e/tsurugashima-fuji' ? E_TEAM_GRADES : GRADES;
+  return ROUTES[routeKey]?.team === 'E' ? E_TEAM_GRADES : GRADES;
 }
 const CLASSES = Object.freeze(['前半', '後半', '相談したい', '①クラス', '②クラス', '③クラス']);
 const CLASS_LABELS_BY_ROUTE = Object.freeze({
