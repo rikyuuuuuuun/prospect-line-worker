@@ -9,6 +9,7 @@ const source=workerSource.replace(/^import .*;\r?$/gm,'').replace(/^export \{.*;
 const legacyRoutes=[...workerSource.matchAll(/'([abcd]\/[^']+)'/g)].map(m=>m[1]);
 const eRoute='e/tsurugashima-fuji';
 const minamiRoute='e/tsurugashima-minami';
+const asakaRoute='e/asaka-dai9';
 test('E is present in the trial form without changing activity venue choices',async()=>{
   const coreSource=(await readFile(new URL('../src/index.js',import.meta.url),'utf8'))
     .replace(/^export \{ ReservationOutbox \} from .*;\r?$/m,'')
@@ -39,6 +40,9 @@ test('E accepts nursery middle-year through junior-high third-year and keeps oth
   assert.equal(config.routes[eRoute].grades.at(-1),'中学3年生');
   assert.deepEqual(config.routes[minamiRoute].grades,config.routes[eRoute].grades);
   assert.equal(config.routes[minamiRoute].venue,'南体操&トランポリンクラブ');
+  assert.deepEqual(config.routes[asakaRoute].grades,config.routes[eRoute].grades);
+  assert.equal(config.routes[asakaRoute].venue,'朝霞第九体操&トランポリンクラブ');
+  assert.throws(()=>c.validateReservation_({...input('年中'),className:'後半'},asakaRoute),/invalid_class/);
   assert.equal(c.validateReservation_(input('中学3年生'),minamiRoute).children[0].grade,'中学3年生');
   assert.throws(()=>c.validateReservation_(input('年少'),minamiRoute),/invalid_grade/);
   assert.equal(config.routes['a/sugishita'].grades.at(-1),'6年生');
@@ -71,7 +75,9 @@ async function push(h,data) {
 test('old 30-venue producer stays valid and always resets E to an empty closed configuration',async()=>{
   const h=setup();assert.equal(legacyRoutes.length,30);
   assert.equal((await push(h,bundle())).status,200);
-  assert.equal(Object.keys(h.stored.byRoute).length,32);
+  assert.equal(Object.keys(h.stored.byRoute).length,33);
+  assert.deepEqual(Array.from(h.stored.byRoute[asakaRoute].classes,c=>[c.value,c.status]),[['前半','closed']]);
+  assert.equal(h.stored.byRoute[asakaRoute].fixedClass,'前半');
   assert.deepEqual(Array.from(h.stored.byRoute[eRoute].classes,c=>[c.value,c.status]),[['前半','closed'],['後半','closed']]);
   assert.deepEqual(Array.from(h.stored.byRoute[eRoute].dates),[]);
   const data=bundle();data.byRoute[eRoute]={dates:[],classes:[{value:'前半',status:'open',time:'17:00〜17:50'},{value:'後半',status:'open',time:'18:00〜18:50'}]};
