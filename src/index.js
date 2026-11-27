@@ -58,6 +58,7 @@ const ROUTES = Object.freeze({
 
   'e/tsurugashima-fuji': route_('LINE_SECRET_E_TSURUGASHIMA_FUJI', 'E', '鶴ヶ島藤', '鶴ヶ島藤体操＆トランポリンクラブ'),
   'e/tsurugashima-minami': route_('LINE_SECRET_E_TSURUGASHIMA_MINAMI', 'E', '鶴ヶ島南', '南体操&トランポリンクラブ'),
+  'e/asaka-dai9': route_('LINE_SECRET_E_ASAKA_DAI9', 'E', '朝霞第九', '朝霞第九体操&トランポリンクラブ', '前半'),
 });
 
 const LINE_ID_TOKEN_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';

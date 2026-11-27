@@ -4,7 +4,11 @@ import legacyAvailability from './legacy-availability.js';
 import { AvailabilitySnapshot } from './availability-snapshot.js';
 import { configDigest, verifyConfigPush, normalizeTrialConfig, currentTrialWindow, TRIAL_CONFIG_MAX_BYTES } from './trial-config.js';
 export { ReservationOutbox, AvailabilitySnapshot, AssistantInbox, configPushKeys };
-const OPTIONAL_E_ROUTES = ['e/tsurugashima-fuji', 'e/tsurugashima-minami'];
+const OPTIONAL_E_SLOTS = {
+  'e/tsurugashima-fuji': ['前半', '後半'],
+  'e/tsurugashima-minami': ['前半', '後半'],
+  'e/asaka-dai9': ['前半'],
+};
 const RESERVATION_ROUTES = Object.freeze([
   'a/saitama-shibakawa', 'a/sugishita', 'a/mizuhodai', 'a/kamekubo',
   'a/ageo-fujimi', 'a/ageo-shibakawa', 'a/kasumigaseki-nishi',
@@ -14,7 +18,7 @@ const RESERVATION_ROUTES = Object.freeze([
   'c/gyoda-nishi', 'c/asaka-dai10', 'c/tokorozawa-minami', 'c/kurohama-minami',
   'd/obukuro-higashi', 'd/shimooshi', 'd/izumi', 'd/yagisaki',
   'd/nakano', 'd/ebinuma', 'd/komatsu', 'd/shima',
-  ...OPTIONAL_E_ROUTES,
+  ...Object.keys(OPTIONAL_E_SLOTS),
 ]);
 const ROUTE_SET = new Set(RESERVATION_ROUTES);
 const LINE_WEBHOOK_QUEUE_NAME = 'prospect-line-webhook-events';
@@ -63,11 +67,13 @@ async function push(request,env,ctx) {
     const input=JSON.parse(body);
     // Accept older GAS releases and clear only the missing E venue's availability.
     if(input?.byRoute && typeof input.byRoute==='object' && !Array.isArray(input.byRoute)) {
-      for (const route of OPTIONAL_E_ROUTES) {
+      for (const [route, slots] of Object.entries(OPTIONAL_E_SLOTS)) {
         if (Object.prototype.hasOwnProperty.call(input.byRoute, route)) continue;
-        input.byRoute[route]={dates:[],classes:[
-          {value:'前半',status:'closed'}, {value:'後半',status:'closed'},
-        ],fixedClass:''};
+        input.byRoute[route] = {
+          dates: [],
+          classes: slots.map(value => ({value, status: 'closed'})),
+          fixedClass: slots.length === 1 ? slots[0] : '',
+        };
       }
     }
     const bundle=normalizeTrialConfig(input,RESERVATION_ROUTES);
